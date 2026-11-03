@@ -1,3 +1,4 @@
+
 import {
   AudioLines,
   House,
@@ -8,11 +9,32 @@ import {
   ChevronRight,
 } from 'lucide-react';
 
-function Sidebar() {
+type Section = 'Dashboard' | 'My Writing Data' | 'My Writing Style' | 'Settings';
+
+type SidebarProps = {
+  activeSection: Section;
+  onNavigate: (section: Section) => void;
+};
+
+function Sidebar({ activeSection, onNavigate }: SidebarProps) {
+  const navigationItems = [
+    {
+      name: 'Dashboard' as Section,
+      icon: House,
+    },
+    {
+      name: 'My Writing Data' as Section,
+      icon: Database,
+    },
+    {
+      name: 'My Writing Style' as Section,
+      icon: WandSparkles,
+    },
+  ];
+
   return (
     <aside className="relative flex h-full w-[224px] shrink-0 flex-col overflow-hidden bg-[#173d30] px-4 py-6 text-[#f4f2e9]">
 
-      {/* Subtle background detail */}
       <div className="pointer-events-none absolute -right-24 top-36 h-64 w-64 rounded-full bg-[#315b46]/30 blur-3xl" />
 
       {/* Brand */}
@@ -38,27 +60,35 @@ function Sidebar() {
         </p>
 
         <nav className="space-y-1">
-          <button
-            className="flex w-full items-center gap-3 rounded-xl bg-[#e9eddf]/10 px-3 py-3 text-left text-sm font-medium text-[#f4f2e9] ring-1 ring-inset ring-[#e9eddf]/10"
-          >
-            <House size={18} strokeWidth={1.8} />
-            <span>Dashboard</span>
-            <ChevronRight size={15} className="ml-auto text-[#a9c5a9]" />
-          </button>
+          {navigationItems.map(function (item) {
+            const Icon = item.icon;
+            const isActive = activeSection === item.name;
 
-          <button
-            className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm text-[#b7c8bd] transition-colors hover:bg-[#e9eddf]/[0.07] hover:text-white"
-          >
-            <Database size={18} strokeWidth={1.8} />
-            <span>My Writing Data</span>
-          </button>
+            return (
+              <button
+                key={item.name}
+                type="button"
+                onClick={function () {
+                  onNavigate(item.name);
+                }}
+                className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm transition-colors ${
+                  isActive
+                    ? 'bg-[#e9eddf]/10 font-medium text-[#f4f2e9] ring-1 ring-inset ring-[#e9eddf]/10'
+                    : 'text-[#b7c8bd] hover:bg-[#e9eddf]/[0.07] hover:text-white'
+                }`}
+              >
+                <Icon size={18} strokeWidth={1.8} />
+                <span>{item.name}</span>
 
-          <button
-            className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm text-[#b7c8bd] transition-colors hover:bg-[#e9eddf]/[0.07] hover:text-white"
-          >
-            <WandSparkles size={18} strokeWidth={1.8} />
-            <span>My Writing Style</span>
-          </button>
+                {isActive && (
+                  <ChevronRight
+                    size={15}
+                    className="ml-auto text-[#a9c5a9]"
+                  />
+                )}
+              </button>
+            );
+          })}
         </nav>
       </div>
 
@@ -69,10 +99,22 @@ function Sidebar() {
         </p>
 
         <button
-          className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm text-[#b7c8bd] transition-colors hover:bg-[#e9eddf]/[0.07] hover:text-white"
+          type="button"
+          onClick={function () {
+            onNavigate('Settings');
+          }}
+          className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm transition-colors ${
+            activeSection === 'Settings'
+              ? 'bg-[#e9eddf]/10 font-medium text-[#f4f2e9] ring-1 ring-inset ring-[#e9eddf]/10'
+              : 'text-[#b7c8bd] hover:bg-[#e9eddf]/[0.07] hover:text-white'
+          }`}
         >
           <Settings size={18} strokeWidth={1.8} />
           <span>Settings</span>
+
+          {activeSection === 'Settings' && (
+            <ChevronRight size={15} className="ml-auto text-[#a9c5a9]" />
+          )}
         </button>
       </div>
 
