@@ -25,5 +25,9 @@ async function getWritingMessages(): Promise<WritingMessage[]> {
     .toArray();
 }
 
-export { db, getWritingMessages };
+async function deleteWritingMessage(id: number): Promise<void> {
+  await db.writingMessages.delete(id);
+}
+
+export { db, getWritingMessages, deleteWritingMessage };
 export type { WritingMessage };
