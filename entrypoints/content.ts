@@ -35,7 +35,16 @@ export default defineContentScript({
       lastCapturedMessage = message;
       lastCapturedTime = currentTime;
 
-      console.log('Echo captured:', message);
+      browser.runtime.sendMessage({
+        type: 'NEW_USER_MESSAGE',
+        text: message,
+        })
+        .then(function () {
+          console.log('Echo: Message sent successfully.');
+        })
+        .catch(function (error) {
+          console.error('Echo: Failed to send message:', error);
+      });
     }
 
     document.addEventListener(
