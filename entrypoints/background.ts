@@ -1,5 +1,5 @@
 
-import { db } from './utils/database';
+import { saveWritingMessage } from './utils/database';
 
 export default defineBackground(() => {
   console.log('Hello background!', { id: browser.runtime.id });
@@ -8,7 +8,7 @@ export default defineBackground(() => {
     if (message.type === 'NEW_USER_MESSAGE') {
       const currentTime = new Date();
 
-      db.writingMessages.add({
+      saveWritingMessage({
         platform: 'ChatGPT',
         text: message.text,
         createdAt: currentTime,
@@ -16,6 +16,11 @@ export default defineBackground(() => {
         trainingStatus: 'pending',
       })
         .then(function (id) {
+          if (id === undefined) {
+            console.log('Echo: Duplicate message ignored.');
+            return;
+          }
+
           console.log('Echo: Message saved with ID:', id);
         })
         .catch(function (error) {
