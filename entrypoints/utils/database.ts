@@ -18,5 +18,12 @@ db.version(1).stores({
   writingMessages: '++id, platform, capturedAt, trainingStatus',
 });
 
-export { db };
+async function getWritingMessages(): Promise<WritingMessage[]> {
+  return db.writingMessages
+    .orderBy('capturedAt')
+    .reverse()
+    .toArray();
+}
+
+export { db, getWritingMessages };
 export type { WritingMessage };

@@ -4,10 +4,15 @@ import { useState } from 'react';
 import Sidebar from './components/Sidebar';
 import WelcomeSection from './components/WelcomeSection';
 import WritingComposer from './components/WritingComposer';
+import WritingData from './components/WritingData';
 
 import heroBackground from '../../assets/hero-background.png';
 
-type Section = 'Dashboard' | 'My Writing Data' | 'My Writing Style' | 'Settings';
+type Section =
+  | 'Dashboard'
+  | 'My Writing Data'
+  | 'My Writing Style'
+  | 'Settings';
 
 function App() {
   const [activeSection, setActiveSection] = useState<Section>('Dashboard');
@@ -23,16 +28,7 @@ function App() {
     }
 
     if (activeSection === 'My Writing Data') {
-      return (
-        <section className="px-12 py-12">
-          <h1 className="font-serif text-4xl text-[#203c30]">
-            My Writing Data
-          </h1>
-          <p className="mt-3 text-sm text-[#68766d]">
-            Your collected writing will appear here.
-          </p>
-        </section>
-      );
+      return <WritingData />;
     }
 
     if (activeSection === 'My Writing Style') {
