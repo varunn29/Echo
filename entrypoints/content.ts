@@ -13,7 +13,7 @@ export default defineContentScript({
         'form[data-chatgpt-composer]'
       );
 
-      const editor = form?.querySelector(
+      const editor = form?.querySelector<HTMLElement>(
         '[contenteditable="true"]'
       );
 
