@@ -21,6 +21,13 @@ db.version(1).stores({
 async function saveWritingMessage(
   message: WritingMessage
 ): Promise<number | undefined> {
+  if (
+    typeof message.text !== 'string' ||
+    !message.text.trim()
+  ) {
+    throw new Error('Invalid writing message: text must not be empty.');
+  }
+
   return db.transaction('rw', db.writingMessages, async function () {
     const normalizedText = message.text.trim();
 
