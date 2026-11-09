@@ -18,8 +18,11 @@ db.version(1).stores({
   writingMessages: '++id, platform, capturedAt, trainingStatus',
 });
 
+const DEFAULT_DUPLICATE_WINDOW_MS = 60 * 1000; // 60 seconds
+
 async function saveWritingMessage(
-  message: WritingMessage
+  message: WritingMessage,
+  duplicateWindowMs: number = DEFAULT_DUPLICATE_WINDOW_MS
 ): Promise<number | undefined> {
   if (
     typeof message.text !== 'string' ||
@@ -28,18 +31,30 @@ async function saveWritingMessage(
     throw new Error('Invalid writing message: text must not be empty.');
   }
 
+  if (!db.isOpen()) {
+    await db.open();
+  }
+
   return db.transaction('rw', db.writingMessages, async function () {
     const normalizedText = message.text.trim();
+    const messageCapturedTime = new Date(message.capturedAt).getTime();
 
-    const existingMessage = await db.writingMessages
+    // Check if an identical message on the same platform was captured within the deduplication window.
+    // Messages captured outside this window are preserved as intentional repetitions.
+    const recentDuplicate = await db.writingMessages
       .where('platform')
       .equals(message.platform)
       .filter(function (savedMessage) {
-        return savedMessage.text.trim() === normalizedText;
+        if (savedMessage.text.trim() !== normalizedText) {
+          return false;
+        }
+
+        const savedCapturedTime = new Date(savedMessage.capturedAt).getTime();
+        return Math.abs(messageCapturedTime - savedCapturedTime) <= duplicateWindowMs;
       })
       .first();
 
-    if (existingMessage) {
+    if (recentDuplicate) {
       return undefined;
     }
 
@@ -48,6 +63,10 @@ async function saveWritingMessage(
 }
 
 async function getWritingMessages(): Promise<WritingMessage[]> {
+  if (!db.isOpen()) {
+    await db.open();
+  }
+
   return db.writingMessages
     .orderBy('capturedAt')
     .reverse()
@@ -55,6 +74,10 @@ async function getWritingMessages(): Promise<WritingMessage[]> {
 }
 
 async function deleteWritingMessage(id: number): Promise<void> {
+  if (!db.isOpen()) {
+    await db.open();
+  }
+
   await db.writingMessages.delete(id);
 }
 
@@ -63,6 +86,7 @@ export {
   saveWritingMessage,
   getWritingMessages,
   deleteWritingMessage,
+  DEFAULT_DUPLICATE_WINDOW_MS,
 };
 
 export type { WritingMessage };

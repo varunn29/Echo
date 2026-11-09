@@ -1,6 +1,6 @@
 
 import { useEffect, useState } from 'react';
-import { Trash2, X, AlertTriangle } from 'lucide-react';
+import { Trash2, X, AlertTriangle, Download } from 'lucide-react';
 
 import {
   getWritingMessages,
@@ -30,6 +30,47 @@ function WritingData() {
 
     loadMessages();
   }, []);
+
+  function handleExport() {
+    if (messages.length === 0) {
+      return;
+    }
+
+    const exportData = {
+      exportedAt: new Date().toISOString(),
+      totalMessages: messages.length,
+      messages: messages.map(function (message) {
+        return {
+          id: message.id,
+          platform: message.platform,
+          text: message.text,
+          createdAt:
+            message.createdAt instanceof Date
+              ? message.createdAt.toISOString()
+              : new Date(message.createdAt).toISOString(),
+          capturedAt:
+            message.capturedAt instanceof Date
+              ? message.capturedAt.toISOString()
+              : new Date(message.capturedAt).toISOString(),
+          trainingStatus: message.trainingStatus,
+        };
+      }),
+    };
+
+    const jsonBlob = new Blob([JSON.stringify(exportData, null, 2)], {
+      type: 'application/json',
+    });
+    const downloadUrl = URL.createObjectURL(jsonBlob);
+    const downloadLink = document.createElement('a');
+    const dateStamp = new Date().toISOString().split('T')[0];
+
+    downloadLink.href = downloadUrl;
+    downloadLink.download = `echo-writing-data-${dateStamp}.json`;
+    document.body.appendChild(downloadLink);
+    downloadLink.click();
+    document.body.removeChild(downloadLink);
+    URL.revokeObjectURL(downloadUrl);
+  }
 
   function openDeleteConfirmation(id: number | undefined) {
     if (id === undefined) {
@@ -68,13 +109,28 @@ function WritingData() {
   return (
     <>
       <section className="px-12 py-12">
-        <h1 className="font-serif text-4xl text-[#203c30]">
-          My Writing Data
-        </h1>
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <h1 className="font-serif text-4xl text-[#203c30]">
+              My Writing Data
+            </h1>
 
-        <p className="mt-3 text-sm text-[#68766d]">
-          Your collected writing, stored privately on this device.
-        </p>
+            <p className="mt-3 text-sm text-[#68766d]">
+              Your collected writing, stored privately on this device.
+            </p>
+          </div>
+
+          {!isLoading && messages.length > 0 && (
+            <button
+              type="button"
+              onClick={handleExport}
+              className="inline-flex items-center gap-2 rounded-xl border border-[#c6d3c2] bg-white/90 px-4 py-2.5 text-xs font-semibold text-[#203c30] shadow-sm transition-colors hover:border-[#9ab094] hover:bg-white"
+            >
+              <Download size={15} />
+              Export Data (JSON)
+            </button>
+          )}
+        </div>
 
         {isLoading && (
           <p className="mt-8 text-sm text-[#68766d]">

@@ -90,6 +90,48 @@ describe('saveWritingMessage', function () {
 
     expect(count).toBe(2);
   });
+
+  it('should preserve intentionally repeated messages captured outside the duplicate window', async function () {
+    const firstTime = new Date('2026-11-01T10:00:00.000Z');
+    const secondTime = new Date('2026-11-01T10:05:00.000Z'); // 5 minutes later
+
+    const firstId = await saveWritingMessage(
+      createMessage('Hello, Echo!', 'ChatGPT', firstTime)
+    );
+
+    const secondId = await saveWritingMessage(
+      createMessage('Hello, Echo!', 'ChatGPT', secondTime)
+    );
+
+    expect(firstId).toBeTypeOf('number');
+    expect(secondId).toBeTypeOf('number');
+    expect(secondId).not.toBe(firstId);
+
+    const count = await db.writingMessages.count();
+    expect(count).toBe(2);
+  });
+
+  it('should respect a custom duplicate window', async function () {
+    const firstTime = new Date('2026-11-01T10:00:00.000Z');
+    const secondTime = new Date('2026-11-01T10:00:10.000Z'); // 10 seconds later
+
+    // With a 5-second window, 10 seconds later is NOT a duplicate
+    const firstId = await saveWritingMessage(
+      createMessage('Hello, Echo!', 'ChatGPT', firstTime),
+      5000
+    );
+
+    const secondId = await saveWritingMessage(
+      createMessage('Hello, Echo!', 'ChatGPT', secondTime),
+      5000
+    );
+
+    expect(firstId).toBeTypeOf('number');
+    expect(secondId).toBeTypeOf('number');
+
+    const count = await db.writingMessages.count();
+    expect(count).toBe(2);
+  });
 });
 
 describe('getWritingMessages', function () {
