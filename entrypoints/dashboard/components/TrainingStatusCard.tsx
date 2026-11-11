@@ -8,6 +8,8 @@ import {
   RefreshCw,
   Layers,
   Cpu,
+  Copy,
+  Check,
 } from 'lucide-react';
 
 import {
@@ -24,6 +26,10 @@ import {
   pollActiveTrainingJob,
   type ActiveTrainingJobRecord,
 } from '../../utils/trainingTrigger';
+import {
+  buildServiceStartupCommand,
+  copyToClipboard,
+} from '../../utils/extensionInfo';
 
 interface TrainingStatusCardProps {
   className?: string;
@@ -35,6 +41,7 @@ export function TrainingStatusCard({ className = '' }: TrainingStatusCardProps) 
   const [activeJob, setActiveJob] = useState<ActiveTrainingJobRecord | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isCommandCopied, setIsCommandCopied] = useState(false);
 
   async function refreshStatus() {
     setIsRefreshing(true);
@@ -177,17 +184,35 @@ export function TrainingStatusCard({ className = '' }: TrainingStatusCardProps) 
       {/* State-specific explanatory messaging */}
       <div className="mt-4 rounded-xl bg-white/70 p-3.5 border border-[#e2e8dd] text-xs leading-relaxed">
         {!isOnline ? (
-          <div className="flex items-start gap-2 text-[#735824]">
-            <AlertTriangle size={15} className="shrink-0 mt-0.5 text-[#b08732]" />
-            <div>
-              <p className="font-medium">Local training service is offline</p>
-              <p className="mt-0.5 text-[#7a6843]">
-                Your writing samples are safely saved in your browser. Start the service at{' '}
-                <code className="rounded bg-[#f0e8d5] px-1 py-0.5 font-mono text-[11px]">
-                  127.0.0.1:11435
-                </code>{' '}
-                to enable automatic personal style training.
-              </p>
+          <div className="space-y-2 text-[#735824]">
+            <div className="flex items-start gap-2">
+              <AlertTriangle size={15} className="shrink-0 mt-0.5 text-[#b08732]" />
+              <div>
+                <p className="font-medium">Local training service is offline</p>
+                <p className="mt-0.5 text-[#7a6843]">
+                  Your writing samples are safely saved in your browser. Start the service on <code className="rounded bg-[#f0e8d5] px-1 py-0.5 font-mono text-[11px]">127.0.0.1:11435</code> with your extension origin allowed:
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center justify-between gap-2 rounded-lg border border-[#e8dfc7] bg-[#fcf9ee] px-2.5 py-1.5">
+              <code className="select-all font-mono text-[10px] text-[#6d5118] break-all">
+                {buildServiceStartupCommand()}
+              </code>
+              <button
+                type="button"
+                onClick={async () => {
+                  const ok = await copyToClipboard(buildServiceStartupCommand());
+                  if (ok) {
+                    setIsCommandCopied(true);
+                    setTimeout(() => setIsCommandCopied(false), 2200);
+                  }
+                }}
+                className="flex shrink-0 items-center gap-1 rounded border border-[#d4c39f] bg-white px-2 py-0.5 text-[10px] font-medium text-[#735824] hover:bg-[#fbf7ed] cursor-pointer"
+                title="Copy service startup command"
+              >
+                {isCommandCopied ? <Check size={10} className="text-[#3b754e]" /> : <Copy size={10} />}
+                <span>{isCommandCopied ? 'Copied' : 'Copy'}</span>
+              </button>
             </div>
           </div>
         ) : isTrainingActive ? (

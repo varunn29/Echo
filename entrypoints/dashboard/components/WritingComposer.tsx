@@ -36,6 +36,14 @@ import {
   type RetrievedKnowledgeResult,
 } from '../../utils/knowledgeRetrieval';
 
+import {
+  getExtensionId,
+  buildServiceStartupCommand,
+  copyToClipboard,
+} from '../../utils/extensionInfo';
+
+import { DEFAULT_OLLAMA_MODEL } from '../../utils/ollamaClient';
+
 function WritingComposer() {
   const [topic, setTopic] = useState('');
   const [leadIn, setLeadIn] = useState('');
@@ -54,6 +62,7 @@ function WritingComposer() {
   const [generatedDraft, setGeneratedDraft] = useState('');
   const [generationMeta, setGenerationMeta] = useState<GenerationResponse | null>(null);
   const [isCopied, setIsCopied] = useState(false);
+  const [isCommandCopied, setIsCommandCopied] = useState(false);
 
   const platforms = [
     {
@@ -150,6 +159,15 @@ function WritingComposer() {
     }
   }
 
+  async function handleCopyStartupCommand() {
+    const cmd = buildServiceStartupCommand();
+    const success = await copyToClipboard(cmd);
+    if (success) {
+      setIsCommandCopied(true);
+      setTimeout(() => setIsCommandCopied(false), 2200);
+    }
+  }
+
   const isServiceReady = serviceStatus?.status === 'ready';
   const isOffline = serviceStatus?.status === 'offline';
   const isLoadingModel = serviceStatus?.status === 'loading';
@@ -158,33 +176,71 @@ function WritingComposer() {
     <section className="relative z-10 space-y-6 px-12 pb-16">
       {/* Service Offline / Degraded Notice */}
       {isOffline && (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#e2d5c5] bg-[#fffaf3] p-4 text-[#8a5d3b] shadow-sm">
-          <div className="flex items-center gap-3">
-            <AlertCircle size={18} className="shrink-0 text-[#b46d3f]" />
-            <div className="text-[12px] leading-5">
-              <span className="font-semibold">Local Generation Service is offline.</span>
-              <p className="text-[11px] text-[#9a6e4d]">
-                Start the service by running{' '}
-                <code className="rounded bg-[#f5ecde] px-1.5 py-0.5 font-mono text-[10px] text-[#6d4323]">
-                  python training/generation_service.py
-                </code>{' '}
-                on <span className="font-mono text-[10px]">127.0.0.1:11435</span>.
-              </p>
+        <div className="space-y-3 rounded-2xl border border-[#e2d5c5] bg-[#fffaf3] p-4 text-[#8a5d3b] shadow-sm">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <AlertCircle size={18} className="mt-0.5 shrink-0 text-[#b46d3f]" />
+              <div className="text-[12px] leading-5">
+                <div className="flex items-center gap-2">
+                  <span className="font-semibold text-[#6d4323]">Local Generation Service is offline</span>
+                  {getExtensionId() && (
+                    <span className="rounded bg-[#f0e4d2] px-1.5 py-0.5 font-mono text-[10px] text-[#7a4e2e]">
+                      ID: {getExtensionId().slice(0, 8)}...
+                    </span>
+                  )}
+                </div>
+                <p className="mt-0.5 text-[11px] text-[#9a6e4d]">
+                  Echo requires CORS authorization for your specific Chrome extension origin. Run the command below to start the service:
+                </p>
+              </div>
             </div>
+
+            <button
+              type="button"
+              onClick={checkHealth}
+              disabled={isCheckingService}
+              className="flex items-center gap-1.5 rounded-lg border border-[#d9c4b0] bg-white px-3 py-1.5 text-[11px] font-medium text-[#7a4e2e] transition hover:bg-[#fbf7f0] disabled:opacity-50"
+            >
+              <RefreshCw
+                size={12}
+                className={isCheckingService ? 'animate-spin' : ''}
+              />
+              {isCheckingService ? 'Checking...' : 'Check Connection'}
+            </button>
           </div>
 
-          <button
-            type="button"
-            onClick={checkHealth}
-            disabled={isCheckingService}
-            className="flex items-center gap-1.5 rounded-lg border border-[#d9c4b0] bg-white px-3 py-1.5 text-[11px] font-medium text-[#7a4e2e] transition hover:bg-[#fbf7f0] disabled:opacity-50"
-          >
-            <RefreshCw
-              size={12}
-              className={isCheckingService ? 'animate-spin' : ''}
-            />
-            {isCheckingService ? 'Checking...' : 'Check Connection'}
-          </button>
+          {/* Interactive Startup Command Display */}
+          <div className="flex items-center justify-between gap-2 rounded-xl border border-[#ecdccb] bg-[#fdf8f0] px-3 py-2">
+            <code className="select-all font-mono text-[11px] text-[#5c371b] break-all">
+              {buildServiceStartupCommand()}
+            </code>
+            <button
+              type="button"
+              onClick={handleCopyStartupCommand}
+              className="flex shrink-0 items-center gap-1 rounded-lg border border-[#d9c4b0] bg-white px-2.5 py-1 text-[11px] font-medium text-[#7a4e2e] shadow-xs transition hover:bg-[#f7efe3] active:scale-95 cursor-pointer"
+              title="Copy service startup command"
+            >
+              {isCommandCopied ? (
+                <>
+                  <Check size={12} className="text-[#3b754e]" />
+                  <span className="text-[#3b754e]">Copied!</span>
+                </>
+              ) : (
+                <>
+                  <Copy size={12} />
+                  <span>Copy</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Architecture note: Ollama vs Python service */}
+          <div className="flex items-center gap-1.5 text-[11px] text-[#a57a5a]">
+            <Info size={12} className="shrink-0" />
+            <span>
+              Echo uses two separate local services: <strong>Ollama</strong> (<code className="font-mono text-[10px]">{DEFAULT_OLLAMA_MODEL}</code> on port 11434) for private knowledge graph extraction, and this <strong>Python service</strong> (port 11435) for personalized LoRA generation.
+            </span>
+          </div>
         </div>
       )}
 

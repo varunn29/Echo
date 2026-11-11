@@ -57,6 +57,7 @@ except ImportError:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11435
 DEFAULT_ALLOWED_ORIGIN = "chrome-extension://mbghefdhlgoladjadphnagkiclmckohf"
+ALLOWED_ORIGIN_PATTERN = re.compile(r"^chrome-extension://([a-p]{32})$")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,6 +65,48 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("EchoGenerationService")
+
+
+def validate_allowed_origin(origin: Optional[str]) -> str:
+    """
+    Validates and normalizes the allowed Chrome extension origin.
+    Enforces strict security boundaries:
+    - Rejects empty, None, or whitespace-only origins.
+    - Rejects wildcard '*' origins.
+    - Rejects non-extension web schemes (http, https, ftp, file, etc.).
+    - Rejects non-Chrome extension schemes (e.g. moz-extension://).
+    - Accepts strictly 'chrome-extension://<id>' where <id> is exactly 32 lowercase chars from 'a' to 'p'.
+    - Normalizes trailing slashes and surrounding whitespace.
+    Raises ValueError with explanatory error message on validation failure.
+    """
+    if not origin or not isinstance(origin, str) or not origin.strip():
+        raise ValueError("Allowed origin cannot be empty. Must be 'chrome-extension://<id>'.")
+
+    cleaned = origin.strip().rstrip("/")
+
+    if "*" in cleaned:
+        raise ValueError("Wildcard origins are disallowed for security. Specify the exact extension origin.")
+
+    if cleaned.startswith(("http://", "https://", "ftp://", "file://")):
+        raise ValueError(
+            f"Web origin '{cleaned}' is disallowed. Allowed origin must be a Chrome extension "
+            f"(e.g., 'chrome-extension://<id>')."
+        )
+
+    if cleaned.startswith("moz-extension://"):
+        raise ValueError(
+            f"Mozilla extension origin '{cleaned}' is disallowed. Echo strictly targets Chrome MV3 "
+            f"(format: 'chrome-extension://<32-character-id>')."
+        )
+
+    match = ALLOWED_ORIGIN_PATTERN.match(cleaned)
+    if not match:
+        raise ValueError(
+            f"Invalid Chrome extension origin format: '{cleaned}'. "
+            f"Expected 'chrome-extension://<id>' where <id> is exactly 32 lowercase characters from 'a' to 'p'."
+        )
+
+    return cleaned
 
 
 def sanitize_error_message(err: Optional[str]) -> Optional[str]:
@@ -146,19 +189,19 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
         Validates request origin.
         Returns (is_allowed, origin_str).
         Missing origin is allowed for local direct loopback requests (e.g. CLI tools/curl).
-        Present origin MUST match active_allowed_origin exactly.
+        Present origin MUST match active_allowed_origin exactly (normalizing trailing slash).
         """
         origin = self.headers.get("Origin")
         if origin is None:
             # Local loopback client without browser origin
             return True, None
 
-        origin = origin.strip()
-        if origin == active_allowed_origin:
-            return True, origin
+        normalized_origin = origin.strip().rstrip("/")
+        if normalized_origin == active_allowed_origin:
+            return True, normalized_origin
 
         # Foreign or unauthorized origin
-        return False, origin
+        return False, origin.strip()
 
     def do_OPTIONS(self) -> None:
         """Handle CORS preflight requests from the extension."""
@@ -810,7 +853,8 @@ def start_service(
     """Initializes the model once and starts the HTTP server."""
     global generator, training_controller, is_model_ready, model_error_msg, active_allowed_origin, server_instance
 
-    active_allowed_origin = allowed_origin
+    validated_origin = validate_allowed_origin(allowed_origin)
+    active_allowed_origin = validated_origin
 
     logger.info("=" * 70)
     logger.info("Echo — Local Generation Service V1 Starting")
@@ -903,12 +947,19 @@ def main():
         logger.error("Security violation: Binding to external network interface '%s' is disallowed. Must bind to 127.0.0.1.", args.host)
         sys.exit(1)
 
+    # Enforce allowed-origin validation
+    try:
+        validated_origin = validate_allowed_origin(args.allowed_origin)
+    except ValueError as e:
+        logger.error("Security violation: Invalid --allowed-origin: %s", str(e))
+        sys.exit(1)
+
     start_service(
         host=args.host,
         port=args.port,
         base_model_name=args.base_model,
         adapter_path=args.adapter,
-        allowed_origin=args.allowed_origin,
+        allowed_origin=validated_origin,
         num_threads=args.threads,
     )
 

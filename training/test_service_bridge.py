@@ -28,6 +28,7 @@ from training.generation_service import (
     DEFAULT_ALLOWED_ORIGIN,
     DEFAULT_PORT,
     sanitize_error_message,
+    validate_allowed_origin,
 )
 from training.training_controller import (
     TrainingController,
@@ -139,7 +140,11 @@ class TestTrainingServiceBridge(unittest.TestCase):
             "Content-Length": str(len(body_bytes)),
         }
         if headers:
-            default_headers.update(headers)
+            for k, v in headers.items():
+                if v is None:
+                    default_headers.pop(k, None)
+                else:
+                    default_headers[k] = v
         req.headers = default_headers
 
         captured_code = 0
@@ -286,7 +291,7 @@ class TestTrainingServiceBridge(unittest.TestCase):
     # 3. Security: Origin and Host Header Validation
     # -------------------------------------------------------------------------
     def test_untrusted_origin_rejected_403(self):
-        code, data, _ = self._execute_request(
+        code, data, headers = self._execute_request(
             "POST",
             "/train",
             body={"samples": self.valid_25_samples},
@@ -294,6 +299,87 @@ class TestTrainingServiceBridge(unittest.TestCase):
         )
         self.assertEqual(code, 403)
         self.assertIn("Forbidden", data["error"])
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_differing_chrome_extension_id_rejected_403(self):
+        code, data, headers = self._execute_request(
+            "POST",
+            "/train",
+            body={"samples": self.valid_25_samples},
+            headers={"Origin": "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba"},
+        )
+        self.assertEqual(code, 403)
+        self.assertIn("Forbidden", data["error"])
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_custom_allowed_origin_succeeds_and_returns_cors_header(self):
+        custom_origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+        gen_service_mod.active_allowed_origin = custom_origin
+
+        code, data, headers = self._execute_request(
+            "GET",
+            "/training/status",
+            headers={"Origin": custom_origin},
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"), custom_origin)
+
+    def test_custom_allowed_origin_with_trailing_slash_in_header_succeeds(self):
+        custom_origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+        gen_service_mod.active_allowed_origin = custom_origin
+
+        code, data, headers = self._execute_request(
+            "GET",
+            "/training/status",
+            headers={"Origin": f"{custom_origin}/"},
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"), custom_origin)
+
+    def test_previous_default_origin_rejected_when_custom_origin_is_configured_403(self):
+        custom_origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+        gen_service_mod.active_allowed_origin = custom_origin
+
+        code, data, headers = self._execute_request(
+            "GET",
+            "/training/status",
+            headers={"Origin": DEFAULT_ALLOWED_ORIGIN},
+        )
+        self.assertEqual(code, 403)
+        self.assertIn("Forbidden", data["error"])
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_preflight_options_with_authorized_custom_origin_204(self):
+        custom_origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+        gen_service_mod.active_allowed_origin = custom_origin
+
+        code, data, headers = self._execute_request(
+            "OPTIONS",
+            "/train",
+            headers={"Origin": custom_origin},
+        )
+        self.assertEqual(code, 204)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"), custom_origin)
+        self.assertIn("POST", headers.get("Access-Control-Allow-Methods", ""))
+
+    def test_preflight_options_with_unauthorized_origin_403(self):
+        code, data, headers = self._execute_request(
+            "OPTIONS",
+            "/train",
+            headers={"Origin": "https://attacker-preflight.com"},
+        )
+        self.assertEqual(code, 403)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_direct_loopback_client_without_origin_header_allowed(self):
+        # Direct CLI/curl client without Origin header
+        code, data, headers = self._execute_request(
+            "GET",
+            "/training/status",
+            headers={"Origin": None},  # No Origin header
+        )
+        self.assertEqual(code, 200)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
 
     def test_disallowed_host_header_rejected_400(self):
         code, data, _ = self._execute_request(
@@ -731,6 +817,133 @@ class TestHTTPConcurrencyAndJobSubmission(unittest.TestCase):
 
         self.assertEqual(status_code2, 202)
         self.assertEqual(data2["status"], "accepted")
+
+
+class TestValidateAllowedOrigin(unittest.TestCase):
+    """Unit tests for strict Chrome extension origin validation."""
+
+    def test_accepts_default_chrome_extension_origin(self):
+        result = validate_allowed_origin(DEFAULT_ALLOWED_ORIGIN)
+        self.assertEqual(result, DEFAULT_ALLOWED_ORIGIN)
+
+    def test_accepts_different_valid_chrome_extension_id(self):
+        valid_other = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+        result = validate_allowed_origin(valid_other)
+        self.assertEqual(result, valid_other)
+
+    def test_rejects_ids_that_are_too_short_or_too_long(self):
+        short_ids = [
+            "chrome-extension://",
+            "chrome-extension://a",
+            "chrome-extension://abcdefghijklmnop",
+            "chrome-extension://abcdefghijklmnopabcdefghijklmno",  # 31 chars
+        ]
+        for val in short_ids:
+            with self.assertRaises(ValueError) as ctx:
+                validate_allowed_origin(val)
+            self.assertIn("invalid chrome extension origin format", str(ctx.exception).lower())
+
+        long_ids = [
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnopx",  # 33 chars
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnopabcdefghijklmnop",  # 48 chars
+        ]
+        for val in long_ids:
+            with self.assertRaises(ValueError) as ctx:
+                validate_allowed_origin(val)
+            self.assertIn("invalid chrome extension origin format", str(ctx.exception).lower())
+
+    def test_rejects_uppercase_ids(self):
+        uppercase_ids = [
+            "chrome-extension://MBGHEFDHLGOLADJADPHNAGKICLMCKOHF",
+            "chrome-extension://Abcdefghijklmnopabcdefghijklmnop",
+            "chrome-extension://abcdefghijklmnopABCDEFGHIKLMNOPA",
+        ]
+        for val in uppercase_ids:
+            with self.assertRaises(ValueError) as ctx:
+                validate_allowed_origin(val)
+            self.assertIn("invalid chrome extension origin format", str(ctx.exception).lower())
+
+    def test_rejects_numeric_ids(self):
+        numeric_ids = [
+            "chrome-extension://12345678901234567890123456789012",
+            "chrome-extension://abcdefghijklmnop1234567890abcdef",
+        ]
+        for val in numeric_ids:
+            with self.assertRaises(ValueError) as ctx:
+                validate_allowed_origin(val)
+            self.assertIn("invalid chrome extension origin format", str(ctx.exception).lower())
+
+    def test_rejects_ids_containing_characters_outside_a_to_p(self):
+        out_of_range_ids = [
+            "chrome-extension://qrstuvwxyzqrstuvwxyzqrstuvwxyz12",
+            "chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef",  # q-z
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnoz",  # 'z' is out of range
+        ]
+        for val in out_of_range_ids:
+            with self.assertRaises(ValueError) as ctx:
+                validate_allowed_origin(val)
+            self.assertIn("invalid chrome extension origin format", str(ctx.exception).lower())
+
+    def test_rejects_hyphens_and_underscores(self):
+        hyphen_underscore_ids = [
+            "chrome-extension://abcdefghijklmnop-abcdefghijklmno",
+            "chrome-extension://abcdefghijklmnop_abcdefghijklmno",
+            "chrome-extension://my_echo-extension_id_abcdefghij",
+        ]
+        for val in hyphen_underscore_ids:
+            with self.assertRaises(ValueError) as ctx:
+                validate_allowed_origin(val)
+            self.assertIn("invalid chrome extension origin format", str(ctx.exception).lower())
+
+    def test_rejects_mozilla_extension_origins(self):
+        moz_origins = [
+            "moz-extension://12345678-1234-1234-1234-123456789abc",
+            "moz-extension://abcdefghijklmnopabcdefghijklmnop",
+        ]
+        for val in moz_origins:
+            with self.assertRaises(ValueError) as ctx:
+                validate_allowed_origin(val)
+            self.assertIn("mozilla extension origin", str(ctx.exception).lower())
+
+    def test_rejects_website_origins(self):
+        web_origins = [
+            "https://google.com",
+            "http://localhost:3000",
+            "http://127.0.0.1:8080",
+            "ftp://evil.com",
+            "file:///etc/passwd",
+        ]
+        for val in web_origins:
+            with self.assertRaises(ValueError) as ctx:
+                validate_allowed_origin(val)
+            self.assertIn("web origin", str(ctx.exception).lower())
+
+    def test_rejects_wildcard_origins(self):
+        wildcards = ["*", "chrome-extension://*", "*://*"]
+        for val in wildcards:
+            with self.assertRaises(ValueError) as ctx:
+                validate_allowed_origin(val)
+            self.assertIn("wildcard", str(ctx.exception).lower())
+
+    def test_strips_trailing_slash_normalization(self):
+        origin = "chrome-extension://mbghefdhlgoladjadphnagkiclmckohf/"
+        result = validate_allowed_origin(origin)
+        self.assertEqual(result, DEFAULT_ALLOWED_ORIGIN)
+
+        valid_other = "chrome-extension://abcdefghijklmnopabcdefghijklmnop/"
+        result_other = validate_allowed_origin(valid_other)
+        self.assertEqual(result_other, "chrome-extension://abcdefghijklmnopabcdefghijklmnop")
+
+    def test_strips_surrounding_whitespace(self):
+        origin = "   chrome-extension://mbghefdhlgoladjadphnagkiclmckohf   "
+        result = validate_allowed_origin(origin)
+        self.assertEqual(result, DEFAULT_ALLOWED_ORIGIN)
+
+    def test_rejects_empty_and_whitespace(self):
+        for val in ("", "   ", None):
+            with self.assertRaises(ValueError) as ctx:
+                validate_allowed_origin(val)
+            self.assertIn("cannot be empty", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":
