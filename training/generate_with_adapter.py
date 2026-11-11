@@ -480,7 +480,7 @@ def build_zero_fact_autobiographical_response(
             resp = (
                 f"I haven't recorded any personal notes or details about my {topic_clean} in Echo yet. "
                 "Looking at the concept generally, having a predictable morning routine often helps establish focus and mental clarity before tackling complex work. "
-                "For many people, coffee serves as a comforting ritual that marks the transition into productive hours, though individual habits naturally vary."
+                "For many people, morning habits serve as a helpful transition into productive hours, though individual cadences naturally vary based on schedule and work demands."
             )
     elif "pet" in lower or "dog" in lower or "cat" in lower:
         if mode == "short":
@@ -525,6 +525,22 @@ def build_zero_fact_autobiographical_response(
             )
 
     return ensure_complete_thoughts(resp)
+
+
+def normalize_fact_sentence(fact: str) -> str:
+    """
+    Normalizes whitespace and terminal punctuation of a verified fact without altering meaning
+    or creating duplicate punctuation.
+    """
+    if not fact or not isinstance(fact, str):
+        return ""
+    s = fact.strip()
+    if not s:
+        return ""
+    # If the fact already ends with terminal punctuation (. ! ?) optionally followed by closing quotes, preserve it
+    if re.search(r'[.!?]["\'”’]?$', s):
+        return s
+    return s + "."
 
 
 def build_grounded_fallback_draft(
@@ -590,7 +606,7 @@ def build_grounded_fallback_draft(
                 "The reason for this approach is to allow users to train their own models directly from their own data."
             )
             p2 = (
-                "Keeping chat data stored in the local IndexedDB ensures that the information remains available locally for users to train their own models. "
+                "Keeping chat data stored in the local IndexedDB allows users to train their own models directly from their chat history. "
                 "Storing data in this manner directly supports local model training without requiring external data storage."
             )
             text = f"{p1}\n\n{p2}"
@@ -624,13 +640,32 @@ def build_grounded_fallback_draft(
 
     # General Fallback Synthesis from affirmative facts
     affirmative = format_affirmative_facts(personal_knowledge)
-    facts_text = " ".join(f.rstrip(".") + "." for f in affirmative)
-    if mode == "short":
-        text = f"{facts_text}"
-    elif mode == "long":
-        text = f"{facts_text}\n\nThese points represent the verified information recorded in Echo regarding this topic."
+    cleaned_facts = [normalize_fact_sentence(f) for f in affirmative if f and f.strip()]
+
+    if not cleaned_facts:
+        if mode == "short":
+            text = "I haven't recorded any personal notes about this topic in Echo yet."
+        elif mode == "long":
+            text = (
+                "I haven't recorded any personal notes or reflections about this topic in Echo yet. "
+                "From a general perspective, reflecting on this topic can offer valuable perspective, "
+                "but an authentic personal draft requires recording actual experiences first.\n\n"
+                "Until verified personal notes are documented in Echo, maintaining this transparent view ensures our records remain strictly grounded in reality."
+            )
+        else:  # medium
+            text = (
+                "I haven't recorded any personal notes or reflections about this topic in Echo yet. "
+                "From a general perspective, reflecting on this topic can offer valuable perspective, "
+                "but an authentic personal draft requires recording actual experiences first."
+            )
     else:
-        text = f"{facts_text} This directly reflects my recorded experience and technical notes."
+        facts_text = " ".join(cleaned_facts)
+        if mode == "short":
+            text = facts_text
+        elif mode == "long":
+            text = f"{facts_text}\n\nThese points represent the verified information recorded in Echo regarding this topic."
+        else:  # medium
+            text = facts_text
 
     return ensure_complete_thoughts(text)
 
@@ -903,12 +938,214 @@ def validate_grounding(
     }
 
 
+def validate_length_compliance(
+    draft: str,
+    length_mode: str = "medium",
+) -> Dict[str, Any]:
+    """
+    Validates that a generated or synthesized draft satisfies length constraints for the requested mode.
+    Medium mode requires at least 2 complete sentences AND at least 25 words.
+    Short mode requires at least 1 complete sentence AND at least 5 words.
+    Long mode requires at least 2 complete sentences AND at least 35 words.
+    """
+    issues = []
+    mode = (length_mode or "medium").lower().strip()
+    clean_text = draft.strip() if draft else ""
+    sentences = extract_sentences(clean_text)
+    sentence_count = len(sentences)
+    words = clean_text.split()
+    word_count = len(words)
+
+    if mode == "short":
+        if sentence_count < 1 or word_count < 5:
+            issues.append(
+                f"insufficient_length: Draft produced {sentence_count} sentence(s) and {word_count} word(s), "
+                f"falling below short minimum threshold (1 sentence, 5 words)"
+            )
+    elif mode == "long":
+        if sentence_count < 2 or word_count < 35:
+            issues.append(
+                f"insufficient_length: Draft produced {sentence_count} sentence(s) and {word_count} word(s), "
+                f"falling below long minimum threshold (2 sentences, 35 words)"
+            )
+    else:  # medium
+        if sentence_count < 2 or word_count < 25:
+            issues.append(
+                f"insufficient_length: Draft produced {sentence_count} sentence(s) and {word_count} word(s), "
+                f"falling below medium minimum threshold (2 sentences, 25 words)"
+            )
+
+    return {
+        "is_compliant": len(issues) == 0,
+        "flagged_issues": issues,
+        "sentence_count": sentence_count,
+        "word_count": word_count,
+        "length_mode": mode,
+    }
+
+
+META_COMMENTARY_PATTERNS = [
+    # Promising or announcing intent to write/draft/compose/provide
+    (
+        r"^\s*I\s+(?:will|shall)\s+(?:write|draft|compose|provide|outline|present)\b",
+        "announces intent to write/draft",
+    ),
+    (
+        r"^\s*I\s+(?:will|shall)\s+(?:explain|describe)\s+(?:in\s+this\s+(?:draft|paragraph|response|essay)|below\b)",
+        "announces intent to explain in text",
+    ),
+    # Presenting the text as an artifact
+    (
+        r"^\s*(?:Here\s+is|Here\'s|This\s+is|Below\s+is)\s+(?:a|an|the|my)\s+(?:draft|response|reflection|paragraph|post|summary|update|answer|text|essay)\b",
+        "introduces response as draft artifact",
+    ),
+    # Intent phrases like "I am going to write / draft / explain..."
+    (
+        r"^\s*I\s+am\s+going\s+to\s+(?:write|draft|compose|summarize|present)\b",
+        "announces intent to write",
+    ),
+    (
+        r"^\s*I\s+am\s+going\s+to\s+(?:explain|describe|talk\s+about)\s+(?:in\s+this\s+(?:draft|paragraph|response)|below\b)",
+        "announces intent to explain in response",
+    ),
+    (
+        r"^\s*I\s+am\s+going\s+to\s+explain\s+my\s+perspective\b",
+        "announces intent to explain perspective",
+    ),
+    # "Let me write / draft / compose..."
+    (
+        r"^\s*Let\s+me\s+(?:write|draft|compose|provide|start\s+by\s+writing)\s+(?:a|an|the|my|this)\b",
+        "announces intent to write",
+    ),
+    # "In this draft/response, I will..."
+    (
+        r"^\s*In\s+this\s+(?:draft|response|paragraph|post|reflection|update),\s*I\b",
+        "references draft container instead of direct voice",
+    ),
+]
+
+
+def validate_meta_commentary(draft: str) -> Dict[str, Any]:
+    """
+    Detects obvious meta-commentary where the model describes what it intends to write
+    or introduces its output as a draft artifact, rather than directly expressing thoughts.
+    Preserves authentic first-person opinions (e.g. 'I think we should...', 'I believe...').
+    """
+    issues = []
+    if not draft or not isinstance(draft, str):
+        return {"is_clean": True, "flagged_issues": []}
+
+    clean_text = draft.strip()
+    for pattern, desc in META_COMMENTARY_PATTERNS:
+        match = re.search(pattern, clean_text, re.IGNORECASE)
+        if match:
+            matched_phrase = match.group(0).strip()
+            issues.append(
+                f"meta_commentary_non_draft: Draft begins with meta-commentary ({desc}: '{matched_phrase}') "
+                "instead of expressing authentic personal writing"
+            )
+            break
+
+    return {
+        "is_clean": len(issues) == 0,
+        "flagged_issues": issues,
+    }
+
+
+def validate_generation_quality(
+    draft: str,
+    topic: str,
+    personal_knowledge: List[str],
+    length_mode: str = "medium",
+) -> Dict[str, Any]:
+    """
+    Decoupled generation quality validator combining:
+    1. Grounding validation (factual fidelity, negative limitations, no unverified claims).
+    2. Meta-commentary validation (no meta announcements of intent to write).
+    3. Length compliance validation (enforcing sentence and word minimum floors).
+    """
+    grounding = validate_grounding(topic, personal_knowledge, draft)
+    meta = validate_meta_commentary(draft)
+    length = validate_length_compliance(draft, length_mode=length_mode)
+
+    all_issues = grounding["flagged_issues"] + meta["flagged_issues"] + length["flagged_issues"]
+    is_acceptable = (
+        grounding["is_grounded"]
+        and meta["is_clean"]
+        and length["is_compliant"]
+    )
+
+    return {
+        "is_acceptable": is_acceptable,
+        "is_grounded": grounding["is_grounded"],
+        "is_clean_meta": meta["is_clean"],
+        "is_compliant_length": length["is_compliant"],
+        "grounding": grounding,
+        "meta_commentary": meta,
+        "length_compliance": length,
+        "flagged_issues": all_issues,
+    }
+
+
 def extract_opening_hook(text: str, num_words: int = 5) -> str:
     """Extracts first num_words normalized alphanumeric words from text for lightweight hook tracking."""
     if not text or not isinstance(text, str):
         return ""
     words = re.findall(r"\b\w+\b", text.lower())
     return " ".join(words[:num_words])
+
+
+def build_shared_prompt(
+    topic: str,
+    personal_knowledge: Optional[List[str]] = None,
+    length_mode: str = "medium",
+    lead_in: str = "",
+) -> str:
+    """
+    Constructs the shared compact prompt for LoRA V3 instruction-conditioned training and inference.
+    Follows Phase 2 Step 4B Stage 2 approved prompt template:
+
+    Instructions: Write an authentic first-person response in the author's conversational writing style.
+    Length: {length}
+    Authoritative Facts:
+    {verified_facts}
+    Topic: {topic}
+
+    Author's Personal Draft:
+    """
+    mode = (length_mode or "medium").lower().strip()
+    if mode == "short":
+        length_str = "Short (1–2 sentences)."
+    elif mode == "long":
+        length_str = "Long (2 structured paragraphs)."
+    else:
+        length_str = "Medium (3–4 sentences)."
+
+    cleaned_facts: List[str] = []
+    if personal_knowledge:
+        aff_facts = format_affirmative_facts(personal_knowledge)
+        cleaned_facts = [f.strip() for f in aff_facts if f and f.strip()]
+
+    if cleaned_facts:
+        facts_block = "\n".join(f"- {f}" for f in cleaned_facts)
+    else:
+        facts_block = "- None available."
+
+    clean_topic = topic.strip() if topic else "General Reflection"
+
+    prompt = (
+        "Instructions: Write an authentic first-person response in the author's conversational writing style.\n"
+        f"Length: {length_str}\n"
+        "Authoritative Facts:\n"
+        f"{facts_block}\n"
+        f"Topic: {clean_topic}\n\n"
+        "Author's Personal Draft:\n"
+    )
+
+    if lead_in and lead_in.strip():
+        prompt += lead_in.strip() + " "
+
+    return prompt
 
 
 class PersonalizedWritingGenerator:
@@ -1172,92 +1409,17 @@ class PersonalizedWritingGenerator:
     @staticmethod
     def build_prompt(
         topic: str,
-        personal_knowledge: List[str],
+        personal_knowledge: Optional[List[str]] = None,
         lead_in: str = "",
         length_mode: str = "medium",
     ) -> str:
-        """Formats personal knowledge and topic into an explicitly grounded generation prompt (Grounding V3)."""
-        has_facts = personal_knowledge and any(item.strip() for item in personal_knowledge)
-        mode = (length_mode or "medium").lower()
-
-        if mode == "short":
-            length_instruction = "Desired Length: Short (1–2 sentences). Express the core insight directly and conclude cleanly without trailing off."
-        elif mode == "long":
-            length_instruction = (
-                "Desired Length: Long (2 structured paragraphs). Provide a thorough reflection: "
-                "in paragraph 1, explain the personal background, motivation, and specific challenge; "
-                "in paragraph 2, explain the approach, resolution, and future implications."
-            )
-        else:  # medium
-            length_instruction = (
-                "Desired Length: Medium (3–4 sentences). Develop the thought with authentic reasoning: "
-                "state the core point, share the context or practical struggle using natural connective words "
-                "('and', 'so', 'because', 'which means'), and conclude with a clear takeaway."
-            )
-
-        if has_facts:
-            affirmative_facts = format_affirmative_facts(personal_knowledge)
-            facts_block = "\n".join(f"- {item.strip()}" for item in affirmative_facts if item.strip())
-            prompt = (
-                "Instructions: Write an authentic first-person update in the author's personal voice ('I', 'my').\n"
-                f"{length_instruction}\n\n"
-                f"Authoritative Personal Facts (About Me):\n{facts_block}\n\n"
-                "Strict Grounding Rules:\n"
-                "1. Ownership: Every project, skill, and experience listed above belongs solely to the author ('I'). "
-                "Never attribute the author's projects or skills to a friend, colleague, client, or team.\n"
-                "2. Status & Temporality: Distinguish completed projects, current mastered skills, and future goals. "
-                "Never describe existing skills as future learning goals. Never describe future learning goals as commercial startups, businesses, or revenue targets.\n"
-                "3. Limitation Fidelity: If a project fact states that it uses static data, simulated matches, or lacks live feeds, "
-                "state the actual operational reality affirmatively (that the project uses static data or simulated matches). NEVER claim or imply that the project provides live matches, live results, real-time odds, or live feeds.\n"
-                "4. Scope Restraint: Do not invent unmentioned features, technologies, tools, programming languages, sports, or platforms. "
-                "Do not invent unverified personal, family, or childhood backstories. Confine all statements strictly to the facts provided above.\n"
-                "5. Detail & Completion: Keep the draft focused on the stated facts, ensuring thoughts and sentences conclude cleanly.\n"
-                "6. Anti-Formulaic Opening: Do NOT begin with generic statistical percentages or formulaic clichés (e.g. '90% of...', 'In today's fast-paced world...'). "
-                "Express thoughts directly in authentic conversational voice.\n\n"
-                f"Topic: {topic.strip()}\n"
-                f"Author's Personal Draft:\n"
-            )
-        elif not has_facts and is_autobiographical_topic(topic):
-            topic_clean = topic.strip().replace("My ", "").replace("my ", "")
-            prompt = (
-                "Instructions: The author has NO recorded personal experiences, notes, or facts for this topic in Echo.\n"
-                "Do NOT invent first-person biographical claims (no fictional pets, no fake daily routines, no invented family).\n"
-                f"{length_instruction}\n"
-                "Begin directly with an honest statement that no personal experiences are recorded for this topic yet in Echo, "
-                "then provide a thoughtful, balanced general reflection on the concept.\n\n"
-                "Authoritative Personal Facts (About Me):\n"
-                "- None available. No personal facts, biographical details, pets, or daily routines exist for this topic.\n\n"
-                "Strict Grounding Rules (Zero-Fact Autobiographical Mode):\n"
-                "1. Zero Personal Fabrication: Do NOT invent pets, dogs, cats, wake-up times, coffee habits, or personal history.\n"
-                "2. Transparent Communication: Acknowledge that Echo lacks personal data for this topic rather than fabricating an authentic experience.\n"
-                "3. Safe General Reflection: Discuss the concept thoughtfully from an objective, general viewpoint.\n"
-                "4. Anti-Formulaic Opening: Do NOT begin with generic statistical percentages or formulaic clichés (e.g. '90% of...').\n\n"
-                f"Topic: {topic.strip()}\n"
-                f"Author's Reflection:\n"
-            )
-            # Pre-anchor reflection disclosure if no explicit lead_in
-            if not lead_in:
-                lead_in = f"I haven't recorded any personal notes about {topic_clean} in Echo yet. From a general perspective,"
-        else:
-            prompt = (
-                "Instructions: Write a thoughtful reflection in the author's conversational voice.\n"
-                f"{length_instruction}\n\n"
-                "Authoritative Personal Facts (About Me):\n"
-                "- None available. No personal facts, biographical details, location, habits, or private preferences exist for this topic.\n\n"
-                "Strict Grounding Rules (Zero-Fact Mode):\n"
-                "1. Direct Discussion Without Fabrication: Discuss the topic directly from a general, thoughtful viewpoint. Do NOT fabricate or invent personal circumstances, location, timezone, pets, employment, daily routine, favorite media, or private life.\n"
-                "2. General First-Person Reasoning: Prefer general reflection over fictional autobiography. Do not invent specific biographical facts, specific media titles, or pretend to have unverified personal experiences.\n"
-                "3. Neutral When Facts Missing: If the topic asks for specific personal information that is not in the facts, state a balanced, general reflection on the concept rather than inventing an answer.\n"
-                "4. Zero Memory Bleed: Do NOT mention or inject unrelated personal projects (such as Task Tracker), past coding tasks, model training experiments, cloud GPUs, or databases into this topic.\n"
-                "5. Completion & Tone: Keep the reflection conversational, grounded, and ensure sentences conclude cleanly.\n"
-                "6. Anti-Formulaic Opening: Do NOT begin with generic statistical percentages or formulaic clichés (e.g. '90% of...').\n\n"
-                f"Topic: {topic.strip()}\n"
-                f"Author's Reflection:\n"
-            )
-
-        if lead_in:
-            prompt += lead_in.strip() + " "
-        return prompt
+        """Formats personal knowledge and topic into the shared generation prompt (Stage 2 approved template)."""
+        return build_shared_prompt(
+            topic=topic,
+            personal_knowledge=personal_knowledge,
+            length_mode=length_mode,
+            lead_in=lead_in,
+        )
 
     def generate(
         self,
@@ -1322,8 +1484,19 @@ class PersonalizedWritingGenerator:
                 "length_mode": mode,
                 "grounding_check": {
                     "is_grounded": True,
+                    "is_acceptable": True,
                     "flagged_issues": [],
                     "fallback_used": True,
+                },
+                "generation_quality": {
+                    "is_acceptable": True,
+                    "is_grounded": True,
+                    "is_clean_meta": True,
+                    "is_compliant_length": True,
+                    "flagged_issues": [],
+                    "grounding": {"is_grounded": True, "flagged_issues": []},
+                    "meta_commentary": {"is_clean": True, "flagged_issues": []},
+                    "length_compliance": {"is_compliant": True, "flagged_issues": []},
                 },
                 "settings": {
                     "max_new_tokens": effective_max_tokens,
@@ -1381,13 +1554,16 @@ class PersonalizedWritingGenerator:
         complete_draft = f"{lead_in.strip()} {decoded_text}".strip() if lead_in else decoded_text
         complete_draft = ensure_complete_thoughts(complete_draft)
 
-        # Grounding V3: Conservative Post-Generation Validation
-        grounding_result = validate_grounding(topic, personal_knowledge, complete_draft)
+        # Generation Quality & Grounding: Conservative Post-Generation Validation
+        quality_result = validate_generation_quality(
+            complete_draft, topic, personal_knowledge, length_mode=mode
+        )
         fallback_used = False
         source = "lora_sampled" if do_sample else "lora_greedy"
 
-        if not grounding_result["is_grounded"]:
-            # If initial generation had issues, first try deterministic greedy retry if sampled
+        if not quality_result["is_acceptable"]:
+            # If initial generation failed quality checks (grounding, meta-commentary, or length),
+            # first try deterministic greedy retry if sampled
             fb_adopted = False
             if do_sample:
                 t_fb_start = time.perf_counter()
@@ -1405,31 +1581,42 @@ class PersonalizedWritingGenerator:
                 fb_text = ensure_complete_thoughts(fb_text)
                 fb_draft = f"{lead_in.strip()} {fb_text}".strip() if lead_in else fb_text
                 fb_draft = ensure_complete_thoughts(fb_draft)
-                fb_grounding = validate_grounding(topic, personal_knowledge, fb_draft)
+                fb_quality = validate_generation_quality(
+                    fb_draft, topic, personal_knowledge, length_mode=mode
+                )
                 t_elapsed += (time.perf_counter() - t_fb_start)
 
-                if fb_grounding["is_grounded"]:
+                if fb_quality["is_acceptable"]:
                     decoded_text = fb_text
                     complete_draft = fb_draft
                     num_generated_tokens = len(fb_tokens)
-                    grounding_result = fb_grounding
+                    quality_result = fb_quality
                     fallback_used = True
                     fb_adopted = True
                     source = "lora_greedy"
 
-            # If greedy generation is ALSO ungrounded or if greedy was run directly:
-            # Enforce deterministic grounded synthesis fallback rather than generating contradictory claims.
+            # If greedy generation is ALSO unacceptable or if greedy was run directly:
+            # Enforce deterministic grounded synthesis fallback rather than generating poor/under-length drafts.
             if not fb_adopted:
                 safe_fallback = build_grounded_fallback_draft(topic, personal_knowledge, length_mode=mode, lead_in=lead_in)
                 decoded_text = safe_fallback
                 complete_draft = safe_fallback
                 num_generated_tokens = len(self.tokenizer.encode(safe_fallback)) if self.tokenizer else len(safe_fallback.split())
-                grounding_result = {"is_grounded": True, "flagged_issues": []}
+                quality_result = {
+                    "is_acceptable": True,
+                    "is_grounded": True,
+                    "is_clean_meta": True,
+                    "is_compliant_length": True,
+                    "flagged_issues": [],
+                    "grounding": {"is_grounded": True, "flagged_issues": []},
+                    "meta_commentary": {"is_clean": True, "flagged_issues": []},
+                    "length_compliance": {"is_compliant": True, "flagged_issues": []},
+                }
                 fallback_used = True
                 source = "grounded_fallback"
 
         # Check for consecutive identical opening hooks in sampled generation
-        if do_sample and grounding_result["is_grounded"] and not fallback_used:
+        if do_sample and quality_result["is_acceptable"] and not fallback_used:
             current_hook = extract_opening_hook(complete_draft, num_words=5)
             if self.last_opening_hook and current_hook and current_hook == self.last_opening_hook:
                 alt_seed = (seed * 37 + 19) % 100000 + 1
@@ -1450,14 +1637,14 @@ class PersonalizedWritingGenerator:
                 alt_text = ensure_complete_thoughts(alt_text)
                 alt_draft = f"{lead_in.strip()} {alt_text}".strip() if lead_in else alt_text
                 alt_draft = ensure_complete_thoughts(alt_draft)
-                alt_grounding = validate_grounding(topic, personal_knowledge, alt_draft)
+                alt_quality = validate_generation_quality(alt_draft, topic, personal_knowledge, length_mode=mode)
                 alt_hook = extract_opening_hook(alt_draft, num_words=5)
-                if alt_grounding["is_grounded"] and alt_hook != self.last_opening_hook:
+                if alt_quality["is_acceptable"] and alt_hook != self.last_opening_hook:
                     raw_generated_text = alt_text
                     decoded_text = alt_text
                     complete_draft = alt_draft
                     num_generated_tokens = len(alt_tokens)
-                    grounding_result = alt_grounding
+                    quality_result = alt_quality
 
         self.last_opening_hook = extract_opening_hook(complete_draft, num_words=5)
 
@@ -1492,10 +1679,12 @@ class PersonalizedWritingGenerator:
             "cpu_estimate": cpu_after,
             "length_mode": mode,
             "grounding_check": {
-                "is_grounded": grounding_result["is_grounded"],
-                "flagged_issues": grounding_result["flagged_issues"],
+                "is_grounded": quality_result["is_grounded"],
+                "is_acceptable": quality_result["is_acceptable"],
+                "flagged_issues": quality_result["flagged_issues"],
                 "fallback_used": fallback_used,
             },
+            "generation_quality": quality_result,
             "settings": {
                 "max_new_tokens": effective_max_tokens,
                 "min_new_tokens": min_new_tokens,
