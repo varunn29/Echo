@@ -2,6 +2,7 @@ import json
 import random
 import time
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 import psutil
 import torch
@@ -19,10 +20,11 @@ LEARNING_RATE = 5e-5
 RANDOM_SEED = 42
 
 
-def load_dataset(tokenizer):
+def load_dataset(tokenizer, dataset_path: Union[Path, str] = DATASET_PATH):
+    path = Path(dataset_path)
     rows = []
 
-    with DATASET_PATH.open("r", encoding="utf-8") as file:
+    with path.open("r", encoding="utf-8") as file:
         for line in file:
             if line.strip():
                 rows.append(json.loads(line))
@@ -59,34 +61,46 @@ def load_dataset(tokenizer):
     return samples
 
 
-def main():
-    random.seed(RANDOM_SEED)
-    torch.manual_seed(RANDOM_SEED)
-    torch.set_num_threads(4)
+def train_adapter(
+    dataset_path: Union[Path, str] = DATASET_PATH,
+    output_dir: Union[Path, str] = OUTPUT_DIR,
+    base_model: str = BASE_MODEL,
+    epochs: int = EPOCHS,
+    learning_rate: float = LEARNING_RATE,
+    random_seed: int = RANDOM_SEED,
+    num_threads: int = 4,
+    device: str = "cpu",
+) -> Dict[str, Any]:
+    dataset_path = Path(dataset_path)
+    output_dir = Path(output_dir)
+
+    random.seed(random_seed)
+    torch.manual_seed(random_seed)
+    torch.set_num_threads(num_threads)
 
     start_time = time.time()
     process = psutil.Process()
 
     print("====================================================")
     print("Echo — Personal LoRA Training Experiment V2")
-    print("Base Model:", BASE_MODEL)
-    print("Dataset Path:", DATASET_PATH)
-    print("Output Dir:", OUTPUT_DIR)
+    print("Base Model:", base_model)
+    print("Dataset Path:", dataset_path)
+    print("Output Dir:", output_dir)
     print("====================================================\n")
 
     print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
 
     print("Loading base model...")
     model = Qwen3_5ForCausalLM.from_pretrained(
-        BASE_MODEL,
+        base_model,
         dtype=torch.float32,
-        device_map="cpu",
+        device_map=device,
     )
     model.config.use_cache = False
 
     print("Loading writing samples...")
-    samples = load_dataset(tokenizer)
+    samples = load_dataset(tokenizer, dataset_path=dataset_path)
 
     total_tokens = sum(len(sample) for sample in samples)
 
@@ -119,7 +133,7 @@ def main():
     optimizer = torch.optim.AdamW(
         (parameter for parameter in model.parameters()
          if parameter.requires_grad),
-        lr=LEARNING_RATE,
+        lr=learning_rate,
     )
 
     epoch_losses = []
@@ -128,7 +142,7 @@ def main():
 
     print("\nStarting fine-tuning...\n")
 
-    for epoch in range(EPOCHS):
+    for epoch in range(epochs):
         shuffled_samples = samples.copy()
         random.shuffle(shuffled_samples)
 
@@ -167,28 +181,29 @@ def main():
         epoch_losses.append(average_loss)
 
         print(
-            f"Epoch {epoch + 1}/{EPOCHS} "
+            f"Epoch {epoch + 1}/{epochs} "
             f"| Average loss: {average_loss:.4f} "
             f"| Cumulative steps: {total_optimizer_steps}"
         )
 
     # Save only the personal adapter, not the full base model
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\nSaving personal adapter V2...")
-    model.save_pretrained(OUTPUT_DIR)
+    print(f"\nSaving personal adapter to {output_dir}...")
+    model.save_pretrained(output_dir)
 
     elapsed_time = time.time() - start_time
     memory_usage = process.memory_info().rss / (1024 ** 3)
 
     summary = {
         "experiment": "Personal LoRA Training V2",
-        "base_model": BASE_MODEL,
-        "dataset_path": str(DATASET_PATH),
+        "base_model": base_model,
+        "dataset_path": str(dataset_path),
+        "output_dir": str(output_dir),
         "samples": len(samples),
         "total_tokens_with_eos": total_tokens,
-        "epochs": EPOCHS,
-        "learning_rate": LEARNING_RATE,
+        "epochs": epochs,
+        "learning_rate": learning_rate,
         "total_optimizer_steps": total_optimizer_steps,
         "epoch_losses": epoch_losses,
         "training_time_seconds": round(elapsed_time, 2),
@@ -196,18 +211,31 @@ def main():
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
-    summary_path = OUTPUT_DIR / "training_summary.json"
+    summary_path = output_dir / "training_summary.json"
     summary_path.write_text(
         json.dumps(summary, indent=4),
         encoding="utf-8",
     )
 
     print("\nFine-tuning completed successfully!")
-    print("Adapter location:", OUTPUT_DIR)
+    print("Adapter location:", output_dir)
     print("Training time:", round(elapsed_time, 2), "seconds")
     print("Process RAM:", round(memory_usage, 2), "GB")
     print("Total optimizer steps:", total_optimizer_steps)
     print("Epoch losses:", epoch_losses)
+
+    return summary
+
+
+def main():
+    train_adapter(
+        dataset_path=DATASET_PATH,
+        output_dir=OUTPUT_DIR,
+        base_model=BASE_MODEL,
+        epochs=EPOCHS,
+        learning_rate=LEARNING_RATE,
+        random_seed=RANDOM_SEED,
+    )
 
 
 if __name__ == "__main__":

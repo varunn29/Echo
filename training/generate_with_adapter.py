@@ -20,6 +20,77 @@ from transformers import AutoTokenizer, Qwen3_5ForCausalLM
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-0.8B-Base"
 DEFAULT_ADAPTER_PATH = "training-output/qwen3.5-0.8b-lora-v2"
 DEFAULT_NUM_THREADS = 4
+DEFAULT_METADATA_PATH = Path("training-output/active_adapter.json")
+
+
+def load_active_adapter_metadata(
+    metadata_path: Optional[Path] = None,
+    default_adapter_path: str = DEFAULT_ADAPTER_PATH,
+) -> Dict[str, Any]:
+    """Reads active adapter metadata. If missing, defaults to initial V2 adapter."""
+    path = metadata_path if metadata_path is not None else DEFAULT_METADATA_PATH
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"Warning: Failed to parse {path}, using defaults: {e}")
+
+    # Default to initial V2 adapter
+    path_obj = Path(default_adapter_path)
+    match = re.search(r"\b(v\d+)\b", path_obj.name, re.IGNORECASE)
+    default_version = match.group(1).lower() if match else path_obj.name
+
+    return {
+        "active_adapter_path": str(default_adapter_path),
+        "active_version": default_version,
+        "activated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "previous_adapter_path": None,
+        "previous_version": None,
+        "status": "ready",
+    }
+
+
+def save_active_adapter_metadata(
+    metadata: Dict[str, Any],
+    metadata_path: Optional[Path] = None,
+) -> None:
+    """Atomically persists active adapter metadata to disk."""
+    path = metadata_path if metadata_path is not None else DEFAULT_METADATA_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def validate_adapter_directory(adapter_path: str | Path) -> Dict[str, Any]:
+    """
+    Validates that the directory exists and contains valid adapter_config.json
+    and adapter weights. Returns the parsed config dictionary.
+    Raises ValueError / FileNotFoundError with a clear message if invalid.
+    """
+    path = Path(adapter_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Adapter directory does not exist: {adapter_path}")
+    if not path.is_dir():
+        raise ValueError(f"Adapter path is not a directory: {adapter_path}")
+
+    config_file = path / "adapter_config.json"
+    if not config_file.exists():
+        raise FileNotFoundError(f"Missing adapter_config.json in: {adapter_path}")
+
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Corrupted adapter_config.json in {adapter_path}: {e}")
+
+    weights_safetensors = path / "adapter_model.safetensors"
+    weights_bin = path / "adapter_model.bin"
+    if not weights_safetensors.exists() and not weights_bin.exists():
+        raise FileNotFoundError(
+            f"No adapter weights file found in {adapter_path} (expected adapter_model.safetensors or adapter_model.bin)"
+        )
+
+    return config
 
 
 def validate_grounding(
@@ -81,17 +152,19 @@ def validate_grounding(
 
 
 class PersonalizedWritingGenerator:
-    """Manages the lifecycle of the base model and LoRA V2 adapter in memory."""
+    """Manages the lifecycle of the base model and versioned LoRA adapters in memory."""
 
     def __init__(
         self,
         base_model_name: str = DEFAULT_BASE_MODEL,
         adapter_path: str = DEFAULT_ADAPTER_PATH,
         num_threads: int = DEFAULT_NUM_THREADS,
+        metadata_path: Optional[Path] = None,
     ):
         self.base_model_name = base_model_name
         self.adapter_path = adapter_path
         self.num_threads = num_threads
+        self.metadata_path = metadata_path
         self.process = psutil.Process()
 
         torch.set_num_threads(self.num_threads)
@@ -103,11 +176,47 @@ class PersonalizedWritingGenerator:
         self.initial_ram_mb = 0.0
         self.loaded_ram_mb = 0.0
 
+        # Adapter versioning and lifecycle tracking
+        self.active_adapter_name = "default"
+        self.active_version = "v2"
+        self.previous_adapter_path: Optional[str] = None
+        self.previous_version: Optional[str] = None
+        self.last_reload_time: Optional[float] = None
+        self.last_reload_status: str = "initial"
+        self.last_reload_error: Optional[str] = None
+
     def load_model(self) -> float:
-        """Loads tokenizer, base model in FP32 on CPU, and attaches LoRA V2 adapter."""
+        """Loads tokenizer, base model in FP32 on CPU, and attaches the active LoRA adapter with safe fallback."""
         print(f"Setting PyTorch threads: {self.num_threads}")
         self.initial_ram_mb = self.process.memory_info().rss / (1024 * 1024)
         t_start = time.perf_counter()
+
+        # Check for configured active adapter metadata
+        candidate_adapter_path = self.adapter_path
+        candidate_version = self.active_version
+
+        metadata = load_active_adapter_metadata(
+            metadata_path=self.metadata_path,
+            default_adapter_path=DEFAULT_ADAPTER_PATH,
+        )
+        configured_path = metadata.get("active_adapter_path")
+        configured_version = metadata.get("active_version", "v2")
+
+        if configured_path:
+            try:
+                validate_adapter_directory(configured_path)
+                candidate_adapter_path = configured_path
+                candidate_version = configured_version
+            except Exception as val_err:
+                print(
+                    f"Warning: Configured adapter in metadata '{configured_path}' is invalid: {val_err}. "
+                    f"Falling back to default V2 adapter '{DEFAULT_ADAPTER_PATH}'."
+                )
+                candidate_adapter_path = DEFAULT_ADAPTER_PATH
+                candidate_version = "v2"
+
+        self.adapter_path = candidate_adapter_path
+        self.active_version = candidate_version
 
         print(f"Loading tokenizer from '{self.base_model_name}'...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name)
@@ -121,16 +230,177 @@ class PersonalizedWritingGenerator:
         self.base_model.config.use_cache = True
         self.base_model.eval()
 
-        print(f"Loading LoRA V2 adapter from '{self.adapter_path}'...")
-        self.model = PeftModel.from_pretrained(self.base_model, self.adapter_path)
+        print(f"Loading active LoRA adapter ({self.active_version}) from '{self.adapter_path}'...")
+        try:
+            self.model = PeftModel.from_pretrained(
+                self.base_model,
+                self.adapter_path,
+                adapter_name=self.active_adapter_name,
+            )
+        except Exception as load_err:
+            if self.adapter_path != DEFAULT_ADAPTER_PATH:
+                print(
+                    f"Warning: Failed to load adapter from '{self.adapter_path}': {load_err}. "
+                    f"Falling back to default V2 adapter '{DEFAULT_ADAPTER_PATH}'."
+                )
+                self.adapter_path = DEFAULT_ADAPTER_PATH
+                self.active_version = "v2"
+                self.model = PeftModel.from_pretrained(
+                    self.base_model,
+                    self.adapter_path,
+                    adapter_name=self.active_adapter_name,
+                )
+            else:
+                raise
+
         self.model.eval()
 
         self.load_time_sec = time.perf_counter() - t_start
         self.loaded_ram_mb = self.process.memory_info().rss / (1024 * 1024)
+        self.last_reload_status = "ready"
 
         print(f"Model and adapter successfully loaded in {self.load_time_sec:.2f}s.")
         print(f"Resident RAM: {self.loaded_ram_mb:.1f} MB (Delta: +{self.loaded_ram_mb - self.initial_ram_mb:.1f} MB)\n")
         return self.load_time_sec
+
+    def reload_adapter(
+        self,
+        new_adapter_path: str,
+        version: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Safely switches the LoRA adapter in memory without reloading the base model.
+        Validates candidate adapter and writes metadata before retiring the old adapter.
+        If loading or metadata save fails, preserves the current active adapter and raises a RuntimeError.
+        """
+        if self.model is None or self.base_model is None:
+            raise RuntimeError("Base model is not loaded. Cannot reload adapter.")
+
+        t_start = time.perf_counter()
+
+        # 1. Validate candidate adapter directory and config
+        config = validate_adapter_directory(new_adapter_path)
+
+        # Infer version if omitted
+        if not version:
+            path_obj = Path(new_adapter_path)
+            match = re.search(r"\b(v\d+)\b", path_obj.name, re.IGNORECASE)
+            version = match.group(1).lower() if match else path_obj.name
+
+        candidate_adapter_name = f"adapter_{version}_{int(time.time() * 1000)}"
+        old_adapter_name = self.active_adapter_name
+        old_adapter_path = self.adapter_path
+        old_version = self.active_version
+
+        candidate_loaded = False
+        candidate_metadata_persisted = False
+
+        try:
+            # 2. Attach candidate adapter to resident base model
+            self.model.load_adapter(new_adapter_path, adapter_name=candidate_adapter_name)
+            self.model.eval()
+            candidate_loaded = True
+
+            elapsed = time.perf_counter() - t_start
+
+            # 3. Atomically persist active adapter metadata BEFORE retiring old adapter
+            meta = {
+                "active_adapter_path": str(new_adapter_path),
+                "active_version": version,
+                "activated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "previous_adapter_path": old_adapter_path,
+                "previous_version": old_version,
+                "status": "ready",
+                "reload_time_sec": round(elapsed, 4),
+            }
+            save_active_adapter_metadata(meta, metadata_path=self.metadata_path)
+            candidate_metadata_persisted = True
+
+            # 4. Switch active adapter in memory
+            self.model.set_adapter(candidate_adapter_name)
+
+            # 5. Update state
+            self.active_adapter_name = candidate_adapter_name
+            self.previous_adapter_path = old_adapter_path
+            self.previous_version = old_version
+            self.adapter_path = new_adapter_path
+            self.active_version = version
+            self.last_reload_time = time.time()
+            self.last_reload_status = "success"
+            self.last_reload_error = None
+
+            # 6. Now safe to free previous in-memory adapter weights (does not touch files on disk)
+            if hasattr(self.model, "delete_adapter"):
+                try:
+                    self.model.delete_adapter(old_adapter_name)
+                except Exception as del_err:
+                    print(f"Warning: Could not delete old in-memory adapter '{old_adapter_name}': {del_err}")
+
+            return {
+                "status": "success",
+                "message": f"Adapter successfully switched to {version}",
+                "activeAdapter": str(new_adapter_path),
+                "activeVersion": version,
+                "previousAdapter": old_adapter_path,
+                "previousVersion": old_version,
+                "reloadTimeSec": round(elapsed, 4),
+            }
+
+        except Exception as e:
+            # Rollback: guarantee old adapter remains active
+            self.last_reload_status = "error"
+            self.last_reload_error = str(e)
+            rollback_warnings = []
+
+            # A. If metadata was already persisted on disk, restore the previous metadata
+            if candidate_metadata_persisted:
+                try:
+                    restore_meta = {
+                        "active_adapter_path": str(old_adapter_path),
+                        "active_version": old_version,
+                        "activated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "previous_adapter_path": self.previous_adapter_path,
+                        "previous_version": self.previous_version,
+                        "status": "ready",
+                    }
+                    save_active_adapter_metadata(restore_meta, metadata_path=self.metadata_path)
+                except Exception as meta_restore_err:
+                    msg = (
+                        f"CRITICAL: Failed to restore active adapter metadata to '{old_adapter_path}': {meta_restore_err}. "
+                        "In-memory state and persisted active_adapter.json may differ!"
+                    )
+                    print(msg)
+                    rollback_warnings.append(msg)
+
+            # B. Cleanup candidate adapter from memory if it was loaded
+            if candidate_loaded and hasattr(self.model, "delete_adapter"):
+                try:
+                    self.model.delete_adapter(candidate_adapter_name)
+                except Exception as del_candidate_err:
+                    rollback_warnings.append(f"Failed to delete candidate adapter from memory: {del_candidate_err}")
+
+            # C. Ensure old adapter remains set as active in memory
+            if hasattr(self.model, "set_adapter"):
+                try:
+                    self.model.set_adapter(old_adapter_name)
+                except Exception as set_old_err:
+                    msg = (
+                        f"CRITICAL: Failed to re-activate previous adapter '{old_adapter_name}' in memory: {set_old_err}. "
+                        "Model state may be inconsistent!"
+                    )
+                    print(msg)
+                    rollback_warnings.append(msg)
+
+            # Maintain in-memory state consistency with the active adapter
+            self.active_adapter_name = old_adapter_name
+            self.adapter_path = old_adapter_path
+            self.active_version = old_version
+
+            error_message = f"Failed to activate candidate adapter '{new_adapter_path}': {e}"
+            if rollback_warnings:
+                error_message += f" | Rollback issues: {'; '.join(rollback_warnings)}"
+
+            raise RuntimeError(error_message) from e
 
     @staticmethod
     def build_prompt(

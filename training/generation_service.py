@@ -7,11 +7,13 @@ Binds strictly to 127.0.0.1 and enforces exact Echo Chrome extension origin vali
 import argparse
 import json
 import logging
+import re
 import signal
 import sys
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import uuid
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -19,12 +21,38 @@ from urllib.parse import urlparse
 import psutil
 
 # Import existing generator
-from generate_with_adapter import (
-    PersonalizedWritingGenerator,
-    DEFAULT_BASE_MODEL,
-    DEFAULT_ADAPTER_PATH,
-    DEFAULT_NUM_THREADS,
-)
+try:
+    from generate_with_adapter import (
+        PersonalizedWritingGenerator,
+        DEFAULT_BASE_MODEL,
+        DEFAULT_ADAPTER_PATH,
+        DEFAULT_NUM_THREADS,
+        load_active_adapter_metadata,
+        save_active_adapter_metadata,
+        validate_adapter_directory,
+    )
+    from training_controller import (
+        TrainingController,
+        TrainingLifecycleState,
+        DEFAULT_MIN_SAMPLES,
+        normalize_samples,
+    )
+except ImportError:
+    from training.generate_with_adapter import (
+        PersonalizedWritingGenerator,
+        DEFAULT_BASE_MODEL,
+        DEFAULT_ADAPTER_PATH,
+        DEFAULT_NUM_THREADS,
+        load_active_adapter_metadata,
+        save_active_adapter_metadata,
+        validate_adapter_directory,
+    )
+    from training.training_controller import (
+        TrainingController,
+        TrainingLifecycleState,
+        DEFAULT_MIN_SAMPLES,
+        normalize_samples,
+    )
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11435
@@ -37,15 +65,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger("EchoGenerationService")
 
+
+def sanitize_error_message(err: Optional[str]) -> Optional[str]:
+    """Removes local filesystem paths, stack frames, and sensitive data from error messages."""
+    if not err:
+        return None
+    sanitized = str(err).strip()
+    # Strip Windows drive paths (e.g. C:\... or D:\...)
+    sanitized = re.sub(r"[a-zA-Z]:\\[^\s'\"]+", "<path>", sanitized)
+    # Strip POSIX paths (e.g. /home/... or /tmp/...)
+    sanitized = re.sub(r"/(?:[a-zA-Z0-9_\-\.]+/)+[a-zA-Z0-9_\-\.]*", "<path>", sanitized)
+    # If multi-line, take only the last summary line
+    lines = [l.strip() for l in sanitized.splitlines() if l.strip()]
+    return lines[-1] if lines else sanitized
+
+
 # Global Service State
 state_lock = threading.Lock()
 generator_lock = threading.Lock()
+training_submission_lock = threading.Lock()
 generator: Optional[PersonalizedWritingGenerator] = None
+training_controller: Optional[TrainingController] = None
+active_training_thread: Optional[threading.Thread] = None
+active_training_job_id: Optional[str] = None
 is_model_ready = False
 model_error_msg: Optional[str] = None
 service_start_time = time.time()
 active_allowed_origin = DEFAULT_ALLOWED_ORIGIN
-server_instance: Optional[HTTPServer] = None
+server_instance: Optional[ThreadingHTTPServer] = None
 
 
 class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
@@ -66,6 +113,8 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.close_connection = True
 
         # Exact origin reflection only when authorized
         if origin and origin == active_allowed_origin:
@@ -157,6 +206,10 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
                             "status": "ready",
                             "model": generator.base_model_name,
                             "adapter": generator.adapter_path,
+                            "adapterVersion": getattr(generator, "active_version", "v2"),
+                            "lastReloadStatus": getattr(generator, "last_reload_status", "ready"),
+                            "lastReloadTime": getattr(generator, "last_reload_time", None),
+                            "previousAdapter": getattr(generator, "previous_adapter_path", None),
                             "loadTimeSec": round(generator.load_time_sec, 2),
                             "residentRamMb": round(current_ram_mb, 1),
                             "uptimeSec": round(time.time() - service_start_time, 1),
@@ -175,10 +228,62 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
                     )
             return
 
+        # Handle GET /training/status
+        if path in ("/training/status", "/api/training/status"):
+            with state_lock:
+                if training_controller is None:
+                    self._send_json_response(
+                        200,
+                        {
+                            "status": "idle",
+                            "jobId": None,
+                            "stage": "idle",
+                            "sampleCount": 0,
+                            "adapterVersion": None,
+                            "startedAt": None,
+                            "completedAt": None,
+                            "durationSec": 0.0,
+                            "error": None,
+                        },
+                        origin=origin,
+                    )
+                    return
+
+                status = training_controller.get_status()
+                started_at_str = (
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(status["startTime"]))
+                    if status.get("startTime")
+                    else None
+                )
+                completed_at_str = (
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(status["endTime"]))
+                    if status.get("endTime")
+                    else None
+                )
+                raw_err = status.get("errorMessage")
+                sanitized_err = sanitize_error_message(raw_err)
+
+                self._send_json_response(
+                    200,
+                    {
+                        "status": status.get("state", "idle"),
+                        "jobId": status.get("jobId"),
+                        "stage": status.get("state", "idle"),
+                        "sampleCount": status.get("sampleCount", 0),
+                        "adapterVersion": status.get("targetVersion"),
+                        "startedAt": started_at_str,
+                        "completedAt": completed_at_str,
+                        "durationSec": status.get("durationSec", 0.0),
+                        "error": sanitized_err,
+                    },
+                    origin=origin,
+                )
+                return
+
         self._send_json_response(404, {"error": f"Endpoint not found: {self.path}"}, origin=origin)
 
     def do_POST(self) -> None:
-        """Handle POST requests (e.g., /generate)."""
+        """Handle POST requests (/generate and /reload)."""
         if not self._validate_host_header():
             self._send_json_response(400, {"error": "Invalid or disallowed Host header"})
             return
@@ -192,11 +297,307 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
-        if path not in ("/generate", "/api/generate"):
+        if path not in ("/generate", "/api/generate", "/reload", "/api/reload", "/train", "/api/train"):
             self._send_json_response(404, {"error": f"Endpoint not found: {self.path}"}, origin=origin)
             return
 
-        # Check model availability
+        # Handle POST /train
+        if path in ("/train", "/api/train"):
+            global active_training_thread, active_training_job_id
+            with state_lock:
+                if not is_model_ready or generator is None or training_controller is None:
+                    self._send_json_response(
+                        503,
+                        {"error": "Training service is unavailable. Check server logs."},
+                        origin=origin,
+                    )
+                    return
+
+                current_status = training_controller.get_status()
+                is_active_state = current_status.get("state") in (
+                    TrainingLifecycleState.PREPARING.value,
+                    TrainingLifecycleState.TRAINING.value,
+                    TrainingLifecycleState.VALIDATING.value,
+                    TrainingLifecycleState.ACTIVATING.value,
+                )
+                is_thread_alive = active_training_thread is not None and active_training_thread.is_alive()
+                is_reserved = active_training_job_id is not None
+
+                if is_active_state or is_thread_alive or is_reserved:
+                    active_id = active_training_job_id or current_status.get("jobId")
+                    logger.warning(
+                        "Rejected /train request: training job is already in progress (%s)",
+                        active_id,
+                    )
+                    self._send_json_response(
+                        409,
+                        {
+                            "status": "conflict",
+                            "error": "A training job is already in progress. Concurrent training is prohibited.",
+                            "activeJobId": active_id,
+                        },
+                        origin=origin,
+                    )
+                    return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+            except (ValueError, TypeError):
+                content_length = 0
+
+            if content_length <= 0:
+                self._send_json_response(400, {"error": "Missing or empty request body"}, origin=origin)
+                return
+
+            MAX_TRAIN_BODY_SIZE = 2 * 1024 * 1024  # 2 MB limit
+            if content_length > MAX_TRAIN_BODY_SIZE:
+                self._send_json_response(413, {"error": "Request body too large (max 2MB)"}, origin=origin)
+                return
+
+            try:
+                body_bytes = self.rfile.read(content_length)
+                payload = json.loads(body_bytes.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as e:
+                logger.warning("Malformed JSON in /train request: %s", str(e))
+                self._send_json_response(400, {"error": "Malformed JSON request body"}, origin=origin)
+                return
+
+            if not isinstance(payload, dict):
+                self._send_json_response(400, {"error": "Request body must be a JSON object"}, origin=origin)
+                return
+
+            # Reject any client attempt to override paths or hyperparameters
+            disallowed_keys = {
+                "output_dir", "outputDir", "dataset_path", "datasetPath",
+                "adapter_path", "adapterPath", "output_root", "outputRoot",
+                "metadata_path", "metadataPath", "epochs", "learning_rate",
+                "learningRate", "batch_size", "batchSize", "base_model", "baseModel",
+            }
+            present_disallowed = disallowed_keys.intersection(payload.keys())
+            if present_disallowed:
+                self._send_json_response(
+                    400,
+                    {
+                        "error": (
+                            "Custom filesystem paths or training configurations are not permitted: "
+                            f"{sorted(present_disallowed)}"
+                        )
+                    },
+                    origin=origin,
+                )
+                return
+
+            samples = payload.get("samples")
+            if samples is None or not isinstance(samples, list):
+                self._send_json_response(
+                    400,
+                    {"error": "Field 'samples' is required and must be a list of writing sample strings or objects"},
+                    origin=origin,
+                )
+                return
+
+            if len(samples) == 0:
+                self._send_json_response(400, {"error": "Field 'samples' cannot be empty"}, origin=origin)
+                return
+
+            MAX_SAMPLES_LIMIT = 500
+            if len(samples) > MAX_SAMPLES_LIMIT:
+                self._send_json_response(
+                    400,
+                    {"error": f"Field 'samples' exceeds maximum limit of {MAX_SAMPLES_LIMIT} items"},
+                    origin=origin,
+                )
+                return
+
+            valid_samples = normalize_samples(samples)
+            min_required = training_controller.min_samples
+            if len(valid_samples) < min_required:
+                self._send_json_response(
+                    400,
+                    {
+                        "error": (
+                            f"Insufficient training samples: got {len(valid_samples)}, "
+                            f"minimum required is {min_required}"
+                        )
+                    },
+                    origin=origin,
+                )
+                return
+
+            job_id = f"train_api_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+            # Atomically reserve the training slot before spawning the worker thread
+            with training_submission_lock:
+                with state_lock:
+                    current_status = training_controller.get_status()
+                    is_active_state = current_status.get("state") in (
+                        TrainingLifecycleState.PREPARING.value,
+                        TrainingLifecycleState.TRAINING.value,
+                        TrainingLifecycleState.VALIDATING.value,
+                        TrainingLifecycleState.ACTIVATING.value,
+                    )
+                    is_thread_alive = active_training_thread is not None and active_training_thread.is_alive()
+                    is_reserved = active_training_job_id is not None
+
+                    if is_active_state or is_thread_alive or is_reserved:
+                        active_id = active_training_job_id or current_status.get("jobId")
+                        logger.warning(
+                            "Rejected concurrent /train request: training job is already in progress or reserved (%s)",
+                            active_id,
+                        )
+                        self._send_json_response(
+                            409,
+                            {
+                                "status": "conflict",
+                                "error": "A training job is already in progress. Concurrent training is prohibited.",
+                                "activeJobId": active_id,
+                            },
+                            origin=origin,
+                        )
+                        return
+
+                    # Reserve slot atomically
+                    active_training_job_id = job_id
+
+            def training_worker():
+                global active_training_thread, active_training_job_id
+                logger.info("Background training worker started for job %s (%d samples)...", job_id, len(valid_samples))
+                try:
+                    training_controller.run_training_job(valid_samples, job_id=job_id)
+                    logger.info("Background training worker completed successfully for job %s.", job_id)
+                except Exception as exc:
+                    logger.exception("Background training worker failed for job %s: %s", job_id, str(exc))
+                finally:
+                    with state_lock:
+                        if active_training_job_id == job_id:
+                            active_training_job_id = None
+
+            try:
+                t = threading.Thread(target=training_worker, name=f"EchoTrainingWorker-{job_id}", daemon=True)
+                with state_lock:
+                    active_training_thread = t
+                t.start()
+            except Exception as thread_err:
+                logger.exception("Failed to spawn background training worker thread for job %s: %s", job_id, str(thread_err))
+                with state_lock:
+                    if active_training_job_id == job_id:
+                        active_training_job_id = None
+                    active_training_thread = None
+                sanitized_err = sanitize_error_message(str(thread_err)) or "Failed to start background training worker"
+                self._send_json_response(
+                    500,
+                    {
+                        "error": f"Failed to initialize training worker thread: {sanitized_err}",
+                        "status": "error",
+                    },
+                    origin=origin,
+                )
+                return
+
+            logger.info("Accepted training job %s with %d samples.", job_id, len(valid_samples))
+            self._send_json_response(
+                202,
+                {
+                    "status": "accepted",
+                    "jobId": job_id,
+                    "message": "Training job accepted and running in background.",
+                    "sampleCount": len(valid_samples),
+                },
+                origin=origin,
+            )
+            return
+
+        # Handle POST /reload
+        if path in ("/reload", "/api/reload"):
+            with state_lock:
+                if not is_model_ready or generator is None:
+                    self._send_json_response(
+                        503,
+                        {"error": "Model service is unavailable. Check server logs."},
+                        origin=origin,
+                    )
+                    return
+
+            target_adapter_path = None
+            version = None
+
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length > 0:
+                if content_length > 65536:
+                    self._send_json_response(413, {"error": "Request body too large (max 64KB)"}, origin=origin)
+                    return
+                try:
+                    body_bytes = self.rfile.read(content_length)
+                    payload = json.loads(body_bytes.decode("utf-8")) if body_bytes.strip() else {}
+                    if isinstance(payload, dict):
+                        target_adapter_path = payload.get("adapterPath") or payload.get("adapter_path")
+                        version = payload.get("version")
+                except Exception as e:
+                    logger.warning("Malformed JSON in reload request: %s", str(e))
+                    self._send_json_response(400, {"error": "Malformed JSON request body"}, origin=origin)
+                    return
+
+            if not target_adapter_path:
+                meta = load_active_adapter_metadata(default_adapter_path=generator.adapter_path)
+                target_adapter_path = meta.get("active_adapter_path", generator.adapter_path)
+                version = version or meta.get("active_version")
+
+            if not isinstance(target_adapter_path, str) or not target_adapter_path.strip():
+                self._send_json_response(
+                    400,
+                    {"error": "Field 'adapterPath' must be a non-empty string"},
+                    origin=origin,
+                )
+                return
+
+            if len(target_adapter_path) > 500:
+                self._send_json_response(
+                    400,
+                    {"error": "Field 'adapterPath' exceeds 500 characters"},
+                    origin=origin,
+                )
+                return
+
+            logger.info(
+                "Executing safe adapter reload to: '%s' (version: %s)...",
+                target_adapter_path,
+                version or "auto",
+            )
+
+            with generator_lock:
+                with state_lock:
+                    try:
+                        reload_result = generator.reload_adapter(target_adapter_path.strip(), version=version)
+                        self._send_json_response(200, reload_result, origin=origin)
+                        return
+                    except (ValueError, FileNotFoundError) as ve:
+                        logger.warning("Adapter reload rejected: %s", str(ve))
+                        self._send_json_response(
+                            400,
+                            {
+                                "status": "error",
+                                "error": str(ve),
+                                "activeAdapter": generator.adapter_path,
+                                "activeVersion": getattr(generator, "active_version", "v2"),
+                            },
+                            origin=origin,
+                        )
+                        return
+                    except Exception as e:
+                        logger.exception("Unexpected error during adapter reload: %s", str(e))
+                        self._send_json_response(
+                            500,
+                            {
+                                "status": "error",
+                                "error": f"Reload failed: {str(e)}",
+                                "activeAdapter": generator.adapter_path,
+                                "activeVersion": getattr(generator, "active_version", "v2"),
+                            },
+                            origin=origin,
+                        )
+                        return
+
+        # Check model availability for generation
         with state_lock:
             if not is_model_ready or generator is None:
                 self._send_json_response(
@@ -375,7 +776,7 @@ def start_service(
     num_threads: int = DEFAULT_NUM_THREADS,
 ) -> None:
     """Initializes the model once and starts the HTTP server."""
-    global generator, is_model_ready, model_error_msg, active_allowed_origin, server_instance
+    global generator, training_controller, is_model_ready, model_error_msg, active_allowed_origin, server_instance
 
     active_allowed_origin = allowed_origin
 
@@ -388,10 +789,11 @@ def start_service(
     logger.info("LoRA Adapter: %s", adapter_path)
     logger.info("=" * 70)
 
-    # 1. Start HTTP Server bound strictly to host (127.0.0.1) first
+    # 1. Start Threaded HTTP Server bound strictly to host (127.0.0.1) first
     server_address = (host, port)
     try:
-        httpd = HTTPServer(server_address, GenerationHTTPRequestHandler)
+        httpd = ThreadingHTTPServer(server_address, GenerationHTTPRequestHandler)
+        httpd.daemon_threads = True
         server_instance = httpd
     except Exception as e:
         logger.error("Failed to bind HTTP server to %s:%d: %s", host, port, str(e))
@@ -418,15 +820,23 @@ def start_service(
             num_threads=num_threads,
         )
         gen.load_model()
+        ctrl = TrainingController(
+            output_root="training-output",
+            base_model=base_model_name,
+            generator=gen,
+            generation_lock=generator_lock,
+        )
         with state_lock:
             generator = gen
+            training_controller = ctrl
             is_model_ready = True
             model_error_msg = None
-        logger.info("Model initialization complete and ready to serve requests.")
+        logger.info("Model and training controller initialization complete and ready to serve requests.")
     except Exception as e:
         logger.exception("Failed to initialize model: %s", str(e))
         with state_lock:
             generator = None
+            training_controller = None
             is_model_ready = False
             model_error_msg = str(e)
         logger.warning("Service running in degraded/error state. Model loading failed.")
@@ -434,6 +844,9 @@ def start_service(
     logger.info("HTTP Service listening on http://%s:%d", host, port)
     logger.info("Health endpoint: http://%s:%d/health", host, port)
     logger.info("Generate endpoint: http://%s:%d/generate", host, port)
+    logger.info("Reload endpoint: http://%s:%d/reload", host, port)
+    logger.info("Training status: http://%s:%d/training/status", host, port)
+    logger.info("Training trigger: http://%s:%d/train", host, port)
 
     try:
         httpd.serve_forever()

@@ -1,4 +1,6 @@
 import Dexie, { type EntityTable } from 'dexie';
+import { classifyContent } from './contentClassifier';
+import { isPotentialStyleSample, isEligibleTrainingSample } from './trainingFilter';
 
 type KnowledgeCategory =
   | 'projects'
@@ -216,6 +218,33 @@ async function deleteWritingMessage(
   );
 }
 
+async function markMessagesTrained(
+  ids: number[],
+  targetDb: EchoDatabase = db
+): Promise<number> {
+  const validIds = ids.filter(id => typeof id === 'number' && !isNaN(id));
+  if (validIds.length === 0) {
+    return 0;
+  }
+
+  if (!targetDb.isOpen()) {
+    await targetDb.open();
+  }
+
+  return targetDb.transaction('rw', targetDb.writingMessages, async function () {
+    let updatedCount = 0;
+    for (const id of validIds) {
+      const updated = await targetDb.writingMessages.update(id, {
+        trainingStatus: 'trained',
+      });
+      if (updated) {
+        updatedCount++;
+      }
+    }
+    return updatedCount;
+  });
+}
+
 async function savePersonalKnowledge(
   item: PersonalKnowledgeItem,
   targetDb: EchoDatabase = db
@@ -369,19 +398,134 @@ async function getEvidenceByMessageId(
     .toArray();
 }
 
+const DEFAULT_TRAINING_READINESS_THRESHOLD = 25;
+
+interface TrainingReadinessBreakdown {
+  nonContent: number;
+  code: number;
+  terminal: number;
+  structuredData: number;
+  shortFragment: number;
+  weakOrNoStyle: number;
+  totalExcluded: number;
+}
+
+interface TrainingReadinessResult {
+  totalPending: number;
+  eligibleCount: number;
+  threshold: number;
+  isReady: boolean;
+  eligibleSamples: WritingMessage[];
+  breakdown: TrainingReadinessBreakdown;
+}
+
+interface TrainingReadinessOptions {
+  threshold?: number;
+}
+
+async function getTrainingReadiness(
+  thresholdOrOptionsOrDb?: number | TrainingReadinessOptions | EchoDatabase,
+  maybeDb?: EchoDatabase
+): Promise<TrainingReadinessResult> {
+  let threshold = DEFAULT_TRAINING_READINESS_THRESHOLD;
+  let targetDb = db;
+
+  if (thresholdOrOptionsOrDb && typeof (thresholdOrOptionsOrDb as EchoDatabase).isOpen === 'function') {
+    targetDb = thresholdOrOptionsOrDb as EchoDatabase;
+  } else if (typeof thresholdOrOptionsOrDb === 'number') {
+    threshold = thresholdOrOptionsOrDb;
+    if (maybeDb) {
+      targetDb = maybeDb;
+    }
+  } else if (thresholdOrOptionsOrDb && typeof thresholdOrOptionsOrDb === 'object') {
+    if (typeof (thresholdOrOptionsOrDb as TrainingReadinessOptions).threshold === 'number') {
+      threshold = (thresholdOrOptionsOrDb as TrainingReadinessOptions).threshold!;
+    }
+    if (maybeDb) {
+      targetDb = maybeDb;
+    }
+  }
+
+  if (!targetDb.isOpen()) {
+    await targetDb.open();
+  }
+
+  // Retrieve writing messages with trainingStatus === 'pending' strictly read-only
+  const pendingMessages = await targetDb.writingMessages
+    .where('trainingStatus')
+    .equals('pending')
+    .toArray();
+
+  const breakdown: TrainingReadinessBreakdown = {
+    nonContent: 0,
+    code: 0,
+    terminal: 0,
+    structuredData: 0,
+    shortFragment: 0,
+    weakOrNoStyle: 0,
+    totalExcluded: 0,
+  };
+
+  const eligibleSamples: WritingMessage[] = [];
+
+  for (const message of pendingMessages) {
+    const text = message.text;
+
+    if (!isPotentialStyleSample(text)) {
+      breakdown.nonContent++;
+      breakdown.totalExcluded++;
+      continue;
+    }
+
+    const classification = classifyContent(text);
+
+    if (classification.contentType === 'code') {
+      breakdown.code++;
+      breakdown.totalExcluded++;
+    } else if (classification.contentType === 'terminal') {
+      breakdown.terminal++;
+      breakdown.totalExcluded++;
+    } else if (classification.contentType === 'structured_data') {
+      breakdown.structuredData++;
+      breakdown.totalExcluded++;
+    } else if (classification.contentType === 'short_fragment') {
+      breakdown.shortFragment++;
+      breakdown.totalExcluded++;
+    } else if (classification.styleSignal !== 'strong') {
+      breakdown.weakOrNoStyle++;
+      breakdown.totalExcluded++;
+    } else {
+      eligibleSamples.push(message);
+    }
+  }
+
+  return {
+    totalPending: pendingMessages.length,
+    eligibleCount: eligibleSamples.length,
+    threshold,
+    isReady: eligibleSamples.length >= threshold,
+    eligibleSamples,
+    breakdown,
+  };
+}
+
 export {
   db,
   createEchoDatabase,
   saveWritingMessage,
   getWritingMessages,
   deleteWritingMessage,
+  markMessagesTrained,
   savePersonalKnowledge,
   getPersonalKnowledge,
   getPersonalKnowledgeById,
   saveKnowledgeEvidence,
   getKnowledgeEvidence,
   getEvidenceByMessageId,
+  getTrainingReadiness,
+  isEligibleTrainingSample,
   DEFAULT_DUPLICATE_WINDOW_MS,
+  DEFAULT_TRAINING_READINESS_THRESHOLD,
 };
 
 export type {
@@ -397,4 +541,7 @@ export type {
   KnowledgeImportance,
   InvalidationReason,
   PersonalKnowledgeFilter,
+  TrainingReadinessResult,
+  TrainingReadinessBreakdown,
+  TrainingReadinessOptions,
 };

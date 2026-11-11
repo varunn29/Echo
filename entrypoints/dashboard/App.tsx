@@ -5,6 +5,7 @@ import Sidebar from './components/Sidebar';
 import WelcomeSection from './components/WelcomeSection';
 import WritingComposer from './components/WritingComposer';
 import WritingData from './components/WritingData';
+import TrainingStatusCard from './components/TrainingStatusCard';
 
 import heroBackground from '../../assets/hero-background.png';
 
@@ -22,6 +23,9 @@ function App() {
       return (
         <>
           <WelcomeSection />
+          <div className="px-12 pb-6">
+            <TrainingStatusCard />
+          </div>
           <WritingComposer />
         </>
       );
@@ -37,9 +41,12 @@ function App() {
           <h1 className="font-serif text-4xl text-[#203c30]">
             My Writing Style
           </h1>
-          <p className="mt-3 text-sm text-[#68766d]">
-            Your personal writing style will be available here.
+          <p className="mt-2 text-sm text-[#68766d]">
+            Your personal LoRA adapter learns your natural writing voice from real message samples.
           </p>
+          <div className="mt-8 max-w-2xl">
+            <TrainingStatusCard />
+          </div>
         </section>
       );
     }
