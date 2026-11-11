@@ -28,6 +28,7 @@ import {
   generatePersonalizedDraft,
   type GenerationServiceHealth,
   type GenerationResponse,
+  type GenerationLengthMode,
 } from '../../utils/generationClient';
 
 import {
@@ -39,6 +40,7 @@ function WritingComposer() {
   const [topic, setTopic] = useState('');
   const [leadIn, setLeadIn] = useState('');
   const [platform, setPlatform] = useState('X');
+  const [lengthMode, setLengthMode] = useState<GenerationLengthMode>('medium');
 
   // Generation & Service States
   const [isGenerating, setIsGenerating] = useState(false);
@@ -111,7 +113,7 @@ function WritingComposer() {
         personalKnowledge: knowledgeResult.formattedStrings,
         leadIn: leadIn.trim(),
         mode: 'sampled',
-        maxTokens: 100,
+        lengthMode,
         temperature: 0.65,
         repetitionPenalty: 1.15,
       });
@@ -349,43 +351,89 @@ function WritingComposer() {
           </div>
         )}
 
+        {/* Zero-Fact Safety Notice */}
+        {retrievedKnowledge?.isAutobiographicalWithoutFacts && (
+          <div className="flex items-center gap-2.5 border-t border-[#e2d5c5] bg-[#fffaf3] px-6 py-2.5 text-[11px] text-[#8a5d3b]">
+            <Info size={14} className="shrink-0 text-[#b46d3f]" />
+            <span>
+              <strong className="font-semibold">Notice:</strong> No verified personal notes exist in Echo for this topic. Echo will provide a general reflection to prevent fabricating personal experiences.
+            </span>
+          </div>
+        )}
+
         {/* Footer Bar */}
         <div className="flex flex-wrap items-center justify-between gap-4 border-t border-[#e9e9df] bg-[#fafaf5]/80 px-6 py-4">
-          {/* Platform selector */}
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="mr-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#899087]">
-              Write for
-            </span>
+          <div className="flex flex-wrap items-center gap-4">
+            {/* Platform selector */}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="mr-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#899087]">
+                Write for
+              </span>
 
-            <div className="flex items-center gap-1 rounded-xl bg-[#eeefe8] p-1">
-              {platforms.map((item) => {
-                const isActive = platform === item.name;
+              <div className="flex items-center gap-1 rounded-xl bg-[#eeefe8] p-1">
+                {platforms.map((item) => {
+                  const isActive = platform === item.name;
 
-                return (
-                  <button
-                    key={item.name}
-                    type="button"
-                    disabled={isGenerating}
-                    onClick={() => setPlatform(item.name)}
-                    className={`flex items-center gap-2 rounded-lg px-3 py-2 text-[11px] font-medium transition-all ${
-                      isActive
-                        ? 'bg-white text-[#315b42] shadow-sm'
-                        : 'text-[#818b80] hover:text-[#315b42]'
-                    } disabled:opacity-60`}
-                  >
-                    {item.icon ? (
-                      <FontAwesomeIcon
-                        icon={item.icon}
-                        className="text-[13px]"
-                      />
-                    ) : (
-                      <Globe2 size={14} strokeWidth={1.8} />
-                    )}
+                  return (
+                    <button
+                      key={item.name}
+                      type="button"
+                      disabled={isGenerating}
+                      onClick={() => setPlatform(item.name)}
+                      className={`flex items-center gap-2 rounded-lg px-3 py-2 text-[11px] font-medium transition-all ${
+                        isActive
+                          ? 'bg-white text-[#315b42] shadow-sm'
+                          : 'text-[#818b80] hover:text-[#315b42]'
+                      } disabled:opacity-60`}
+                    >
+                      {item.icon ? (
+                        <FontAwesomeIcon
+                          icon={item.icon}
+                          className="text-[13px]"
+                        />
+                      ) : (
+                        <Globe2 size={14} strokeWidth={1.8} />
+                      )}
 
-                    {item.name}
-                  </button>
-                );
-              })}
+                      {item.name}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Length selector */}
+            <div className="flex items-center gap-2">
+              <span className="mr-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#899087]">
+                Length
+              </span>
+
+              <div className="flex items-center gap-1 rounded-xl bg-[#eeefe8] p-1">
+                {(['short', 'medium', 'long'] as const).map((mode) => {
+                  const isActive = lengthMode === mode;
+                  const labelMap = {
+                    short: 'Short (1–2s)',
+                    medium: 'Medium (Post)',
+                    long: 'Long (Detailed)',
+                  };
+
+                  return (
+                    <button
+                      key={mode}
+                      type="button"
+                      disabled={isGenerating}
+                      onClick={() => setLengthMode(mode)}
+                      className={`rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition-all ${
+                        isActive
+                          ? 'bg-white text-[#315b42] shadow-sm'
+                          : 'text-[#818b80] hover:text-[#315b42]'
+                      } disabled:opacity-60`}
+                    >
+                      {labelMap[mode]}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </div>
 

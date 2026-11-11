@@ -696,11 +696,20 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
         if mode not in ("sampled", "greedy"):
             mode = "sampled"
 
-        try:
-            max_tokens = int(payload.get("maxTokens", 85))
-            max_tokens = max(10, min(max_tokens, 256))
-        except (ValueError, TypeError):
-            max_tokens = 85
+        raw_length_mode = payload.get("lengthMode") or payload.get("length_mode") or "medium"
+        if isinstance(raw_length_mode, str) and raw_length_mode.lower() in ("short", "medium", "long"):
+            length_mode = raw_length_mode.lower()
+        else:
+            length_mode = "medium"
+
+        has_explicit_max_tokens = "maxTokens" in payload or "max_tokens" in payload
+        max_tokens = None
+        if has_explicit_max_tokens:
+            try:
+                parsed_max = int(payload.get("maxTokens") or payload.get("max_tokens"))
+                max_tokens = max(10, min(parsed_max, 256))
+            except (ValueError, TypeError):
+                max_tokens = None
 
         try:
             temperature = float(payload.get("temperature", 0.65))
@@ -719,13 +728,19 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
             seed = 42
 
         # Serialize inference with concurrency lock to avoid CPU thrashing
-        logger.info("Generating personalized draft for topic: '%s' (mode: %s)...", topic.strip()[:60], mode)
+        logger.info(
+            "Generating personalized draft for topic: '%s' (mode: %s, length: %s)...",
+            topic.strip()[:60],
+            mode,
+            length_mode,
+        )
         with generator_lock:
             try:
                 res = generator.generate(
                     topic=topic.strip(),
                     personal_knowledge=personal_knowledge,
                     lead_in=lead_in.strip(),
+                    length_mode=length_mode,
                     max_new_tokens=max_tokens,
                     temperature=temperature,
                     repetition_penalty=repetition_penalty,
@@ -757,10 +772,11 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
             "metadata": {
                 "topic": topic.strip(),
                 "mode": mode,
+                "lengthMode": length_mode,
                 "model": generator.base_model_name,
                 "adapter": generator.adapter_path,
                 "repetitionPenalty": repetition_penalty,
-                "maxTokens": max_tokens,
+                "maxTokens": res.get("settings", {}).get("max_new_tokens", max_tokens or 85),
             },
         }
 

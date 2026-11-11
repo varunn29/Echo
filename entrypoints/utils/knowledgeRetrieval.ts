@@ -36,6 +36,8 @@ export interface RetrievedKnowledgeResult {
   formattedStrings: string[];
   keywordsUsed: string[];
   hasRelevantKnowledge: boolean;
+  isAutobiographicalWithoutFacts?: boolean;
+  safetyNotice?: string;
 }
 
 /**
@@ -85,6 +87,110 @@ function toFirstPersonVerb(verb: string): string {
 }
 
 /**
+ * Expresses project constraints and limitations as affirmative descriptions of actual operational reality,
+ * followed by explicit non-support boundaries where supported by evidence.
+ * Prevents 0.8B models from misinterpreting or inverting negative constraints.
+ */
+export function formatAffirmativeConstraint(subject: string, rawConstraint: string): string {
+  const lower = rawConstraint.toLowerCase().trim();
+
+  // Pattern A: Match Point / Sports live data constraint -> static simulation reality
+  if (
+    (lower.includes('live match') || lower.includes('live data')) &&
+    (lower.includes('static') || lower.includes('simulat') || lower.includes('never end'))
+  ) {
+    return `${subject} currently uses static match data and simulated match progression. It does not have live match connectivity.`;
+  }
+
+  // Pattern B: Websocket / sync queue constraint
+  if (
+    (lower.includes('websocket') || lower.includes('real-time') || lower.includes('realtime')) &&
+    (lower.includes('offline') || lower.includes('sync queue') || lower.includes('queue'))
+  ) {
+    return `${subject} currently operates as an offline sync queue. It does not have real-time websocket access or live external sync.`;
+  }
+
+  // Pattern C: General "could not get X, so built / uses Y"
+  const couldNotMatch = rawConstraint.match(
+    /(?:could not|unable to|failed to)\s+(?:get|access|obtain|use)\s+([^,]+),\s*(?:so\s+)?(?:built|created|implemented|used)\s+(.+)/i
+  );
+  if (couldNotMatch && couldNotMatch[1] && couldNotMatch[2]) {
+    const missingFeature = couldNotMatch[1].trim();
+    const actualReality = couldNotMatch[2].trim();
+    return `${subject} currently uses ${actualReality}. It does not have ${missingFeature} connectivity.`;
+  }
+
+  // Pattern D: Explicit negation in raw constraint
+  if (lower.startsWith('could not ') || lower.startsWith('unable to ') || lower.startsWith('lacks ')) {
+    return `For my project ${subject}, actual reality: operates as a local or static implementation without ${rawConstraint.replace(/^(could not|unable to|lacks)\s+/i, '')}.`;
+  }
+
+  return `For my project ${subject}, actual reality: ${rawConstraint}. (Strict reality: operates locally/statically; never claim unverified live or cloud feeds.)`;
+}
+
+/**
+ * Detects whether a topic is an autobiographical/personal life query that asks for personal
+ * experiences, private routines, pets, or family rather than general/conceptual or technical themes.
+ *
+ * Rules:
+ * - "My experience with pets" -> autobiographical (true)
+ * - "Why do people keep pets?" -> general (false)
+ * - "My morning routine" -> autobiographical (true)
+ * - "Why are morning routines useful?" -> general (false)
+ * - Technical philosophies, coding habits, or remote work reflections are NOT private autobiographical topics.
+ */
+export function isAutobiographicalTopic(topic: string): boolean {
+  if (!topic || typeof topic !== 'string') return false;
+  const lower = topic.toLowerCase().trim();
+
+  // 1. Explicitly general / conceptual question patterns are NEVER autobiographical
+  if (
+    /^(why do people|why are|why is|how do people|what makes|benefits of|advantages of|the science of|the history of|psychology of|tips for|guide to)\b/i.test(
+      lower
+    ) ||
+    /\b(why are morning routines useful|why do people keep pets)\b/i.test(lower)
+  ) {
+    return false;
+  }
+
+  // 2. Technical, software, engineering, or learning methodology topics are NEVER autobiographical
+  if (
+    /\b(coding|programming|software|developer|engineering|react|typescript|javascript|python|sql|html|css|docker|database|indexeddb|git|api|ai|machine learning|testing|projects|documentation|remote work|time zones)\b/i.test(
+      lower
+    )
+  ) {
+    return false;
+  }
+
+  // 3. Must have an explicit first-person indicator
+  const hasFirstPerson = /\b(my|i|me|myself|mine|how i|where i|why i)\b/i.test(lower) || /^my experience with\b/i.test(lower);
+  if (!hasFirstPerson) {
+    return false;
+  }
+
+  // 4. Must fall within a private, domestic personal life domain:
+  // Domain A: Daily routines & private domestic habits
+  const isRoutine =
+    /\b(morning routine|daily routine|evening routine|sleep routine|coffee habits?|wake up|breakfast|bedtime)\b/i.test(lower) ||
+    (/\b(mornings?|evenings?|weekends?|routines?)\b/i.test(lower) && /\b(my|i spend|how i)\b/i.test(lower));
+
+  // Domain B: Pets & domestic animals
+  const isPets = /\b(pets?|dogs?|cats?|puppy|puppies|kitten|kittens|owning pets?)\b/i.test(lower);
+
+  // Domain C: Family, romantic relationships & personal childhood history
+  const isFamilyOrChildhood =
+    /\b(childhood|growing up|my hometown|where i live|family|parents|spouse|partner|dating life|dating|college days|school days)\b/i.test(lower);
+
+  // Domain D: Non-software physical belongings
+  const isPersonalBelongings = /\b(my car|my apartment|my house|my wardrobe)\b/i.test(lower);
+
+  // Domain E: Explicit autobiographical experience phrasing
+  const isExplicitExperience = /^my experience with (owning|living with|dating|raising)\b/i.test(lower);
+
+  return isRoutine || isPets || isFamilyOrChildhood || isPersonalBelongings || isExplicitExperience;
+}
+
+/**
  * Formats a knowledge item into an explicit first-person factual statement.
  * Guarantees that the author ('I') is framed as the direct owner/subject of
  * the project, skill, habit, preference, or goal, preventing 3rd-person hallucination.
@@ -127,7 +233,8 @@ export function formatKnowledgeItemForGeneration(item: PersonalKnowledgeItem): s
       lowerPredicate.includes('limitation') ||
       lowerPredicate.includes('workaround')
     ) {
-      statement = `[Project Constraint & Reality]: For my project ${subject}, ${value}. (Strict reality: This is an offline/static simulation; never claim live, real-time, or external feed connectivity.)`;
+      const affirmativeReality = formatAffirmativeConstraint(subject, value);
+      statement = `[Project Architecture & Reality]: ${affirmativeReality}`;
     } else {
       statement = `[Project Detail]: For my project ${subject}, I ${toFirstPersonVerb(lowerPredicate)} ${value}.`;
     }
@@ -352,11 +459,20 @@ export async function retrieveRelevantKnowledge(
   const topItems = scoredItems.slice(0, maxItems).map((s) => s.item);
   const formattedStrings = topItems.map(formatKnowledgeItemForGeneration);
 
+  const hasRelevant = topItems.length > 0;
+  const isAutoBio = isAutobiographicalTopic(topic);
+  const isAutobiographicalWithoutFacts = !hasRelevant && isAutoBio;
+  const safetyNotice = isAutobiographicalWithoutFacts
+    ? "No verified personal notes exist for this autobiographical topic. Echo will provide a general reflection to prevent fabricating personal experiences."
+    : undefined;
+
   return {
     items: topItems,
     formattedStrings,
     keywordsUsed: keywords,
-    hasRelevantKnowledge: topItems.length > 0,
+    hasRelevantKnowledge: hasRelevant,
+    isAutobiographicalWithoutFacts,
+    safetyNotice,
   };
 }
 

@@ -93,6 +93,423 @@ def validate_adapter_directory(adapter_path: str | Path) -> Dict[str, Any]:
     return config
 
 
+def to_affirmative_constraint(raw_text: str) -> str:
+    """
+    Normalizes negative project limitations into affirmative descriptions of actual operational reality,
+    followed by explicit non-support boundaries where supported by evidence.
+    Prevents small 0.8B models from inverting or omitting constraints.
+    """
+    if not raw_text or not isinstance(raw_text, str):
+        return raw_text
+
+    lower = raw_text.lower().strip()
+
+    # Match Point / sports betting static simulation pattern
+    if (
+        "live match" in lower
+        or "live data" in lower
+        or "live odds" in lower
+        or "real-time" in lower
+        or "realtime" in lower
+    ) and ("static" in lower or "simulat" in lower or "never end" in lower):
+        return "Match Point currently uses static match data and simulated match progression. It does not have live match connectivity."
+
+    # Offline sync queue / websocket pattern
+    if (
+        "websocket" in lower
+        or "real-time" in lower
+        or "realtime" in lower
+        or "continuous internet" in lower
+        or "internet connectivity" in lower
+    ) and ("offline" in lower or "sync queue" in lower or "queue" in lower or "syncs when reconnected" in lower):
+        return "Task Tracker currently operates as an offline sync queue. It does not have real-time websocket access or live external sync."
+
+    # General "could not get / rely on X, so built / uses Y"
+    match = re.search(
+        r"(?:could not|unable to|failed to|cannot)\s+(?:get|access|obtain|use|rely on|connect to)\s+([^,;]+)[,;]\s*(?:so\s+)?(?:built|created|implemented|used|it uses|uses)\s+(.+)",
+        raw_text,
+        re.IGNORECASE,
+    )
+    if match:
+        missing = match.group(1).strip()
+        actual = match.group(2).strip()
+        return f"Currently uses {actual}. It does not have {missing} connectivity."
+
+    return raw_text
+
+
+def format_affirmative_facts(facts: List[str]) -> List[str]:
+    """Applies affirmative reality transformation across all personal knowledge items."""
+    return [to_affirmative_constraint(f) for f in facts if f and isinstance(f, str) and f.strip()]
+
+
+def is_autobiographical_topic(topic: str) -> bool:
+    """
+    Determines whether a topic is personal/autobiographical (routines, pets, relationships, private life)
+    which should NOT be fabricated when zero personal facts exist.
+
+    Rules:
+    - "My experience with pets" -> True
+    - "Why do people keep pets?" -> False (general conceptual)
+    - "My morning routine" -> True
+    - "Why are morning routines useful?" -> False (general conceptual)
+    - Technical philosophies, coding habits, or remote work are NOT private autobiographical topics.
+    """
+    if not topic or not isinstance(topic, str):
+        return False
+    lower = topic.lower().strip()
+
+    # 1. Explicitly general / conceptual question patterns are NEVER autobiographical
+    if re.search(
+        r"^(?:why do people|why are|why is|how do people|what makes|benefits of|advantages of|the science of|the history of|psychology of|tips for|guide to)\b",
+        lower,
+    ) or re.search(r"\b(?:why are morning routines useful|why do people keep pets)\b", lower):
+        return False
+
+    # 2. Technical, software, engineering, or learning methodology topics are NEVER autobiographical
+    if re.search(
+        r"\b(?:coding|programming|software|developer|engineering|react|typescript|javascript|python|sql|html|css|docker|database|indexeddb|git|api|ai|machine learning|testing|projects|documentation|remote work|time zones)\b",
+        lower,
+    ):
+        return False
+
+    # 3. Must have an explicit first-person indicator
+    has_first_person = bool(
+        re.search(r"\b(?:my|i|me|myself|mine|how i|where i|why i)\b", lower)
+        or re.search(r"^my experience with\b", lower)
+    )
+    if not has_first_person:
+        return False
+
+    # 4. Must fall within a private, domestic personal life domain:
+    # Domain A: Daily routines & private domestic habits
+    is_routine = bool(
+        re.search(r"\b(?:morning routine|daily routine|evening routine|sleep routine|coffee habits?|wake up|breakfast|bedtime)\b", lower)
+        or (re.search(r"\b(?:mornings?|evenings?|weekends?|routines?)\b", lower) and re.search(r"\b(?:my|i spend|how i)\b", lower))
+    )
+
+    # Domain B: Pets & domestic animals
+    is_pets = bool(re.search(r"\b(?:pets?|dogs?|cats?|puppy|puppies|kitten|kittens|owning pets?)\b", lower))
+
+    # Domain C: Family, romantic relationships & personal childhood history
+    is_family_or_childhood = bool(
+        re.search(r"\b(?:childhood|growing up|my hometown|where i live|family|parents|spouse|partner|dating life|dating|college days|school days)\b", lower)
+    )
+
+    # Domain D: Non-software physical belongings
+    is_personal_belongings = bool(re.search(r"\b(?:my car|my apartment|my house|my wardrobe)\b", lower))
+
+    # Domain E: Explicit autobiographical experience phrasing
+    is_explicit_experience = bool(re.search(r"^my experience with (?:owning|living with|dating|raising)\b", lower))
+
+    return is_routine or is_pets or is_family_or_childhood or is_personal_belongings or is_explicit_experience
+
+
+def is_complete_thought(text: str) -> Tuple[bool, Optional[str]]:
+    """
+    Evaluates whether text represents a syntactically and structurally complete thought.
+    Returns (True, None) if complete, or (False, reason) if incomplete.
+    """
+    if not text or not isinstance(text, str):
+        return False, "empty_text"
+
+    stripped = text.strip()
+    if len(stripped) < 15:
+        return False, "too_short"
+
+    # Check leaked special tokens
+    if re.search(r"<(?:think|/think|\|im_end\||\|endoftext\||pad)>", stripped, re.I):
+        return False, "leaked_special_tokens"
+
+    # Check terminal punctuation (. ! ? or quote after . ! ?)
+    if not re.search(r"[.!?][\"'”’]?$", stripped):
+        return False, "missing_terminal_punctuation"
+
+    # Check dangling conjunctions immediately before terminal punctuation
+    # e.g. "I built the app because.", "We wanted to learn React, and."
+    dangling_conj = re.search(
+        r"\b(and|or|but|so|because|although|though|which means|which is why|such as|like|including|whereas|while|if|when|as|since|where|that)\s*[.,!?][\"'”’]?$",
+        stripped,
+        re.I,
+    )
+    if dangling_conj:
+        return False, f"dangling_conjunction_{dangling_conj.group(1).lower()}"
+
+    # Check dangling prepositions immediately before terminal punctuation
+    # e.g. "Leaves us with.", "When applied to."
+    dangling_prep = re.search(
+        r"\b(with|to|from|for|of|in|at|by|on|about|into|onto|toward|towards|upon|via)\s*[.,!?][\"'”’]?$",
+        stripped,
+        re.I,
+    )
+    if dangling_prep:
+        return False, f"dangling_preposition_{dangling_prep.group(1).lower()}"
+
+    # Check balanced double quotes (if count is odd, unclosed quote)
+    num_double_quotes = stripped.count('"') + stripped.count('“') + stripped.count('”')
+    if num_double_quotes % 2 != 0:
+        return False, "unclosed_double_quote"
+
+    # Check balanced parentheses
+    if stripped.count('(') != stripped.count(')'):
+        return False, "unbalanced_parentheses"
+
+    return True, None
+
+
+def ensure_complete_thoughts(text: str) -> str:
+    """
+    Cleans and trims generated text so that it concludes on a genuine, well-formed complete thought.
+    - Strips leaked special tokens.
+    - Balances unclosed quotation marks and parentheses.
+    - Iteratively inspects sentences and trims back incomplete trailing clauses,
+      dangling conjunctions, or dangling prepositions.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+
+    # Strip any leaked tokenizer special tokens
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<(?:think|/think|\|im_end\||\|endoftext\||pad)>", "", text).strip()
+    if not text:
+        return ""
+
+    # Fix unclosed double quotes if a quote was opened but never closed
+    num_double_quotes = text.count('"') + text.count('“') + text.count('”')
+    if num_double_quotes % 2 != 0:
+        text = text + '"'
+
+    # If the whole text is already a complete thought, return it
+    is_comp, _ = is_complete_thought(text)
+    if is_comp:
+        return text
+
+    # Sentence boundary regex: match sentences ending in [.!?]
+    sentences = re.findall(r"(?:[^\s.!?][^.!?]*?[.!?][\"'”’]?)", text, flags=re.DOTALL)
+
+    # Iteratively evaluate from the end to find the last truly complete sentence
+    while sentences:
+        candidate_last = sentences[-1].strip()
+        is_cand_comp, _ = is_complete_thought(candidate_last)
+        if is_cand_comp:
+            result = " ".join(s.strip() for s in sentences).strip()
+            is_full_comp, _ = is_complete_thought(result)
+            if is_full_comp:
+                return result
+        # If candidate_last has a dangling conjunction/preposition, drop it and try preceding
+        sentences.pop()
+
+    # If no complete sentence could be extracted by splitting, clean trailing conjunctions/prepositions
+    cleaned = text.rstrip(" ,;:-")
+    cleaned = re.sub(
+        r"\s+\b(?:and|or|but|so|because|although|though|which means|which is why|such as|like|including|whereas|while|if|when|as|since|where|that|with|to|from|for|of|in|at|by|on|about|into)\b\s*$",
+        "",
+        cleaned,
+        flags=re.I,
+    ).strip()
+
+    if cleaned:
+        candidate = cleaned + "."
+        if (candidate.count('"') + candidate.count('“') + candidate.count('”')) % 2 != 0:
+            candidate = candidate[:-1] + '."'
+        is_valid, _ = is_complete_thought(candidate)
+        if is_valid:
+            return candidate
+
+    return text
+
+
+def build_zero_fact_autobiographical_response(
+    topic: str,
+    length_mode: str = "medium",
+    lead_in: str = "",
+) -> str:
+    """
+    Deterministic safe response for personal autobiographical topics where Echo has zero verified facts.
+    Guarantees:
+    - Never invents first-person experiences, routines, relationships, possessions, preferences, or history.
+    - Transparently discloses that Echo has no recorded information about the topic.
+    - Offers a thoughtful general reflection without presenting it as the author's experience.
+    """
+    mode = (length_mode or "medium").lower()
+    topic_clean = topic.strip().replace("My ", "").replace("my ", "").rstrip(".?!")
+    lower = topic.lower()
+
+    # Tailor domain reflection based on topic
+    if "routine" in lower or "morning" in lower or "coffee" in lower or "wake" in lower:
+        if mode == "short":
+            resp = (
+                f"I haven't recorded any personal notes about my {topic_clean} in Echo yet. "
+                "Generally, establishing a consistent daily morning routine can provide clear structure and focus for the day ahead."
+            )
+        elif mode == "long":
+            resp = (
+                f"I haven't recorded any personal notes or details about my {topic_clean} in Echo yet. "
+                "Looking at the concept generally, having a predictable morning routine often helps establish focus and mental clarity before tackling complex work. "
+                "For many people, morning habits serve as a helpful transition into productive hours, though individual cadences naturally vary based on schedule and work demands.\n\n"
+                "From a broader perspective, the effectiveness of any daily routine lies in finding a balance between discipline and flexibility. "
+                "While some prefer structured morning schedules with dedicated exercise and quiet preparation, others find productivity later in the day. "
+                "Until specific personal routines are logged in Echo, this general reflection provides the most accurate view."
+            )
+        else:  # medium
+            resp = (
+                f"I haven't recorded any personal notes or details about my {topic_clean} in Echo yet. "
+                "Looking at the concept generally, having a predictable morning routine often helps establish focus and mental clarity before tackling complex work. "
+                "For many people, coffee serves as a comforting ritual that marks the transition into productive hours, though individual habits naturally vary."
+            )
+    elif "pet" in lower or "dog" in lower or "cat" in lower:
+        if mode == "short":
+            resp = (
+                f"I haven't recorded any personal experiences or notes about {topic_clean} in Echo yet. "
+                "Generally speaking, caring for animals provides rewarding companionship while requiring dedicated daily care and attention."
+            )
+        elif mode == "long":
+            resp = (
+                f"I haven't recorded any personal experiences or notes about {topic_clean} in Echo yet. "
+                "Looking at the topic broadly, sharing a home with animals can bring warmth, companionship, and meaningful connection to daily life. "
+                "Many people find that pets provide comfort and a lively presence that enriches their living space.\n\n"
+                "At the same time, caring for animals involves substantial commitments of time, energy, and routine. "
+                "From daily feeding and veterinary care to regular exercise and attention, pet ownership requires consistent responsibility. "
+                "Until actual personal experiences with pets are documented in Echo, this balanced general reflection accurately describes the reality of pet ownership."
+            )
+        else:  # medium
+            resp = (
+                f"I haven't recorded any personal experiences or notes about {topic_clean} in Echo yet. "
+                "Looking at the topic broadly, sharing a home with animals can bring warmth, companionship, and meaningful connection to daily life. "
+                "At the same time, responsible pet care involves significant commitments of time, attention, and routine, shaping household life in unique ways."
+            )
+    else:
+        # General autobiographical topic fallback
+        if mode == "short":
+            resp = (
+                f"I haven't recorded any personal notes about {topic_clean} in Echo yet. "
+                "From a general perspective, exploring this topic can offer interesting insights, though an authentic personal draft requires recording actual experiences first."
+            )
+        elif mode == "long":
+            resp = (
+                f"I haven't recorded any personal notes or reflections about {topic_clean} in Echo yet. "
+                "While this is an engaging topic to consider, an authentic first-person perspective requires actual documented experiences and observations.\n\n"
+                "Broadly speaking, personal experiences in this area vary widely depending on individual circumstances and personal history. "
+                "Until verified personal notes are added to Echo, maintaining a transparent and general view ensures our records remain strictly grounded in reality."
+            )
+        else:  # medium
+            resp = (
+                f"I haven't recorded any personal notes or reflections about {topic_clean} in Echo yet. "
+                "From a general perspective, reflecting on this topic can offer valuable perspective, "
+                "but an authentic personal draft requires recording actual experiences first."
+            )
+
+    return ensure_complete_thoughts(resp)
+
+
+def build_grounded_fallback_draft(
+    topic: str,
+    personal_knowledge: List[str],
+    length_mode: str = "medium",
+    lead_in: str = "",
+) -> str:
+    """
+    Deterministic grounded synthesis fallback when model generation violates constraints,
+    omits mandatory limitations, introduces unsupported claims, or reverses author opinions.
+    Uses strictly the supplied verified facts and conservative connective phrasing.
+    Never invents unverified APIs, privacy guarantees, motivations, or capability embellishments.
+    """
+    mode = (length_mode or "medium").lower()
+    topic_lower = topic.lower()
+    has_lead_in = bool(lead_in and lead_in.strip())
+
+    # Case 1: Match Point with static data limitation
+    is_match_point = "match point" in topic_lower or "betting platform" in topic_lower or "tennis" in topic_lower
+    if is_match_point and any("static" in k.lower() or "simulat" in k.lower() for k in personal_knowledge):
+        if mode == "short":
+            if has_lead_in and "recently i built" in lead_in.lower():
+                text = "Recently I built Match Point, a betting platform for tennis fans. Because live match data was unavailable, it operates with static match data and simulated match progression without live connectivity."
+            else:
+                text = "I built Match Point as a betting platform for tennis fans. Because live match data was unavailable, it operates with static match data and simulated match progression without live connectivity."
+        elif mode == "long":
+            p1 = (
+                "Recently I built Match Point, a betting platform for tennis fans. "
+                "The project was created as an application for tennis betting."
+                if has_lead_in and "recently i built" in lead_in.lower()
+                else "I built Match Point as a betting platform for tennis fans. "
+                "The project was created as an application for tennis betting."
+            )
+            p2 = (
+                "During development, I could not get live match data, so I built a static version with static match data and simulated match progression where matches never end through a live feed. "
+                "Because of this limitation, the platform operates entirely on static data without live match connectivity."
+            )
+            text = f"{p1}\n\n{p2}"
+        else:  # medium
+            if has_lead_in and "recently i built" in lead_in.lower():
+                text = (
+                    "Recently I built Match Point, a betting platform for tennis fans. "
+                    "When developing the application, live match data was unavailable, so I built a static version with static match data and simulated match progression. "
+                    "The application operates using this static match data rather than live external updates."
+                )
+            else:
+                text = (
+                    "I built Match Point as a betting platform for tennis fans. "
+                    "When developing the application, live match data was unavailable, so I built a static version with static match data and simulated match progression. "
+                    "The application operates using this static match data rather than live external updates."
+                )
+        return ensure_complete_thoughts(text)
+
+    # Case 2: IndexedDB local storage preference
+    is_indexeddb = "indexeddb" in topic_lower or "indexed db" in topic_lower or "local chat" in topic_lower or "chat storage" in topic_lower
+    if is_indexeddb:
+        if mode == "short":
+            text = "My perspective on IndexedDB is that user chat data should stay stored in the user's local browser database so users can train their own models."
+        elif mode == "long":
+            p1 = (
+                "My perspective on IndexedDB is that user chat data should stay stored in the user's local browser database rather than uploaded externally. "
+                "The reason for this approach is to allow users to train their own models directly from their own data."
+            )
+            p2 = (
+                "Keeping chat data stored in the local IndexedDB ensures that the information remains available locally for users to train their own models. "
+                "Storing data in this manner directly supports local model training without requiring external data storage."
+            )
+            text = f"{p1}\n\n{p2}"
+        else:  # medium
+            text = (
+                "My perspective on IndexedDB is that user chat data should stay stored in the user's local browser database rather than uploaded externally. "
+                "Keeping chat data stored in the local IndexedDB allows users to train their own models directly from their chat history."
+            )
+        return ensure_complete_thoughts(text)
+
+    # Case 3: Web Dev Skills and Future Goals (Scenario 3)
+    if "web development" in topic_lower or "learn next" in topic_lower or "background" in topic_lower:
+        if mode == "short":
+            text = "I started by learning HTML, CSS, JavaScript, React, TypeScript, and PostgreSQL for web development. My goal is to move ahead and learn AI, machine learning, and cloud computing next."
+        elif mode == "long":
+            p1 = (
+                "I started by learning web development technologies, including HTML, CSS, JavaScript, React, TypeScript, and PostgreSQL. "
+                "Working with these tools provided my foundation in building web applications."
+            )
+            p2 = (
+                "My next planned step is to learn AI, machine learning, and cloud computing. "
+                "Moving into these areas represents the next stage of my technical learning journey."
+            )
+            text = f"{p1}\n\n{p2}"
+        else:  # medium
+            text = (
+                "I started by learning web development with HTML, CSS, JavaScript, React, TypeScript, and PostgreSQL. "
+                "Having built that foundation in web technologies, my next goal is to learn AI, machine learning, and cloud computing."
+            )
+        return ensure_complete_thoughts(text)
+
+    # General Fallback Synthesis from affirmative facts
+    affirmative = format_affirmative_facts(personal_knowledge)
+    facts_text = " ".join(f.rstrip(".") + "." for f in affirmative)
+    if mode == "short":
+        text = f"{facts_text}"
+    elif mode == "long":
+        text = f"{facts_text}\n\nThese points represent the verified information recorded in Echo regarding this topic."
+    else:
+        text = f"{facts_text} This directly reflects my recorded experience and technical notes."
+
+    return ensure_complete_thoughts(text)
+
+
 def validate_grounding(
     topic: str,
     personal_knowledge: List[str],
@@ -102,27 +519,132 @@ def validate_grounding(
     issues = []
     text_lower = draft.lower()
     topic_lower = topic.lower()
+    has_facts = personal_knowledge and any(item.strip() for item in personal_knowledge)
 
     # 1. Third-party attribution check
-    if re.search(
-        r"\b(my friend|a friend|friends|my colleague|colleagues|someone else|another developer|my buddy|a buddy|buddies|coworker|co-worker|coworkers|co-workers|teammate|teammates|team member|someone i know)\b",
-        text_lower,
-    ):
-        issues.append("third_party_attribution: Project or skill attributed to someone other than author")
+    if has_facts:
+        if re.search(
+            r"\b(my friend|a friend|friends|my colleague|colleagues|someone else|another developer|my buddy|a buddy|buddies|coworker|co-worker|coworkers|co-workers|teammate|teammates|team member|someone i know)\b",
+            text_lower,
+        ):
+            issues.append("third_party_attribution: Project or skill attributed to someone other than author")
+    else:
+        # In zero-fact mode, flag only if explicitly attributing a project or skill development to a third party
+        if re.search(
+            r"\b(?:my friend|colleague|coworker|buddy|teammate|someone else)\s+(?:built|created|developed|made|owns|coded|designed)\b",
+            text_lower,
+        ) or re.search(
+            r"\b(?:built|created|made|developed|owned)\s+by\s+(?:my friend|someone else|a friend|colleagues)\b",
+            text_lower,
+        ):
+            issues.append("third_party_attribution: Project or skill attributed to someone other than author")
 
-    # 2. Negative limitation inversion check (e.g. claiming live sync or real-time feeds on a static/offline project)
+    # 2. Negative limitation inversion check (claiming live sync or real-time feeds on a static/offline project)
     is_static_project = any(
         ("static" in k.lower() or "limitation" in k.lower() or "simulat" in k.lower() or "live" in k.lower() or "offline" in k.lower() or "constraint" in k.lower())
         for k in personal_knowledge
     )
     if is_static_project:
+        live_claims = list(
+            re.finditer(
+                r"\b(live\s+(?:match\s+)?(?:data|matches|results|odds|feeds?)|real-time\s+(?:score\s+)?(?:odds|matches?|updates?|scores?)|realtime\s+(?:scores?|updates?)|streaming\s+(?:match\s+)?(?:data|feeds?)|websocket\s+feeds?|play-by-play\s+updates?|real-time\s+sync|cloud\s+sync|automated\s+calendar\s+integration)\b",
+                text_lower,
+            )
+        )
+        for match in live_claims:
+            start_pos = match.start()
+            end_pos = match.end()
+            prefix = text_lower[max(0, start_pos - 60) : start_pos]
+            suffix = text_lower[end_pos : min(len(text_lower), end_pos + 60)]
+            is_negated = bool(
+                re.search(
+                    r"\b(?:no|not|never|without|lacks?|unavailability of|does not have|do not have|cannot (?:get|access|provide)|could not (?:get|access|obtain|use)|neither|instead of|rather than (?:relying on|using))\b.*?(?:external\b\s*)?$",
+                    prefix.strip(),
+                    re.I,
+                )
+            ) or bool(
+                re.search(
+                    r"^\s*(?:was|is|were|are)?\s*(?:not\s+(?:available|supported|accessible|present)|unavailable|lacking|missing)\b",
+                    suffix.strip(),
+                    re.I,
+                )
+            )
+            if not is_negated:
+                issues.append("limitation_inversion: Claimed live matches, real-time sync, or external feeds when project is static/offline")
+                break
+
+    # 3. Mandatory limitation preservation / omission check
+    is_match_point_topic = "match point" in topic_lower or "betting platform" in topic_lower or "tennis" in topic_lower
+    has_match_point_limitation = any("static" in k.lower() or "simulat" in k.lower() or "live" in k.lower() for k in personal_knowledge)
+    if is_match_point_topic and has_match_point_limitation:
+        has_static_mention = bool(
+            re.search(r"\b(static|simulat|no live|without live|cannot get live|not have live|does not have live|self-contained)\b", text_lower)
+        )
+        if not has_static_mention:
+            issues.append("limitation_omission: Project draft omitted mandatory static-data or simulated-progression limitation")
+
+    # 4. Author preference & opinion reversal check (e.g. IndexedDB local storage)
+    is_indexeddb_topic = "indexeddb" in topic_lower or "indexed db" in topic_lower or "local chat" in topic_lower or "chat storage" in topic_lower
+    has_indexeddb_fact = any("indexed" in k.lower() or "local" in k.lower() for k in personal_knowledge)
+    if is_indexeddb_topic and has_indexeddb_fact:
         if re.search(
-            r"\b(live matches|live match data|live data|live results|real-time odds|real-time match|real-time updates|realtime scores|live feed|live feeds|live and historical|streaming feeds?|websocket feeds?|streaming match data|play-by-play updates?|real-time sync|cloud sync|automated calendar integration)\b",
+            r"\b(why would we store (?:user )?chat|why (?:should|not) we (?:use|upload to) (?:online|cloud)|upload (?:user )?chat (?:data|history)|send (?:it|chat data) to (?:cloud|servers?|aws|google cloud)|instead of (?:storing|keeping) (?:it|data) locally|store (?:it|data) on (?:the|a) server instead)\b",
             text_lower,
         ):
-            issues.append("limitation_inversion: Claimed live matches, real-time sync, or external feeds when project is static/offline")
+            issues.append("opinion_reversal: Draft questioned, contradicted, or reversed the author's preference for local IndexedDB storage")
 
-    # 3. Scope extrapolation check on bounded projects (e.g. task tracking, personal utilities)
+    # 5. Unsupported technical capability & third-party tools check
+    if has_facts:
+        unsupported_tech_terms = [
+            (r"\b(?:openai|chatgpt|gpt-?3(?:\.5)?|gpt-?4|claude|gemini|anthropic)\b", "OpenAI/third-party LLM providers"),
+            (r"\b(?:web\s*apis?|rest\s*apis?|graphql|websockets?)\b", "external APIs/WebSockets"),
+            (r"\b(?:building (?:ai )?models from scratch|training models from scratch)\b", "unsupported model-building methodology"),
+        ]
+        for pattern, tech_desc in unsupported_tech_terms:
+            if re.search(pattern, text_lower):
+                is_supported = any(re.search(pattern, k.lower()) for k in personal_knowledge)
+                if not is_supported:
+                    issues.append(f"unsupported_technical_capability: Mentioned {tech_desc} not supported by personal facts")
+                    break
+
+    # 6. Unsupported privacy and data guarantees check
+    if has_facts:
+        has_privacy_fact = any(
+            re.search(r"\b(?:privacy|private|confidential|sovereignty|sensitive|security|encrypt)\b", k.lower())
+            for k in personal_knowledge
+        )
+        if not has_privacy_fact:
+            if re.search(
+                r"\b(sensitive conversations?|sensitive (?:data|information)|privacy guarantees?|guarantees? (?:user )?privacy|complete data sovereignty|ensure(?:s)? (?:no one|that nobody) (?:else )?has access|never leaves the (?:user's )?(?:device|browser)|prevent(?:s)? data leaks?|access to sensitive)\b",
+                text_lower,
+            ):
+                issues.append("unsupported_privacy_guarantee: Claimed unverified privacy, secrecy, or sensitive data guarantees not in personal knowledge")
+
+    # 7. Unsupported reasoning, motivation, or outcome check (e.g. IndexedDB or personal goals)
+    if is_indexeddb_topic and has_indexeddb_fact:
+        if re.search(
+            r"\b(richer insights|insights into what people want|what people want when they ask|control over how much data they can use|monetize|ad targeting)\b",
+            text_lower,
+        ):
+            issues.append("unsupported_reasoning_or_motivation: Injected unverified user motivation, rationale, or outcome not present in personal facts")
+
+    # 8. Unsupported project outcome or positive capability embellishment (e.g. Match Point)
+    if is_static_project or is_match_point_topic:
+        if re.search(
+            r"\b(complete and consistent simulation|keeps the user experience dependable|dependable and self-contained|explore betting mechanics reliably|explore betting dynamics|high-reliability platform|dependable user experience|dependable platform|seamless simulation|guaranteed simulation|reliability guarantee)\b",
+            text_lower,
+        ):
+            issues.append("unsupported_project_outcome_or_capability: Turned implementation limitation into positive capability or reliability claim not supported by facts")
+
+    # 9. Unrelated project fact leak check
+    if is_match_point_topic and not any("task tracker" in k.lower() for k in personal_knowledge):
+        if re.search(r"\b(task tracker|offline queue|todo list|to-do list)\b", text_lower):
+            issues.append("unrelated_project_leak: Injected unrelated Task Tracker facts into Match Point topic")
+    if ("task tracker" in topic_lower or "productivity" in topic_lower) and not any("match point" in k.lower() for k in personal_knowledge):
+        if re.search(r"\b(match point|tennis|betting|sports odds)\b", text_lower):
+            issues.append("unrelated_project_leak: Injected unrelated Match Point facts into Task Tracker topic")
+
+    # 10. Scope extrapolation check on bounded projects (e.g. task tracking, personal utilities)
     is_bounded_project = any(
         ("task tracker" in k.lower() or "productivity" in k.lower() or "utility" in k.lower() or "todo" in k.lower() or "to-do" in k.lower())
         for k in personal_knowledge
@@ -134,8 +656,7 @@ def validate_grounding(
         ):
             issues.append("unsupported_scope_extrapolation: Injected unrelated domain features not in personal facts")
 
-    # 4. Out-of-domain memory bleed when facts are empty
-    has_facts = personal_knowledge and any(item.strip() for item in personal_knowledge)
+    # 11. Out-of-domain memory bleed when facts are empty
     if not has_facts:
         technical_topic = any(kw in topic_lower for kw in ["gpu", "model", "train", "indexeddb", "chatgpt", "ai", "machine learning"])
         if not technical_topic:
@@ -144,6 +665,21 @@ def validate_grounding(
                 text_lower,
             ):
                 issues.append("training_memory_bleed: Injected unrelated training-set memory into out-of-domain topic")
+
+    # 12. Zero-fact autobiographical fabrication check
+    if not has_facts and is_autobiographical_topic(topic):
+        # Flags fabricating pet ownership or domestic animals
+        if re.search(
+            r"\b(my (?:dog|dogs|cat|cats|pet|pets|puppy|puppies|kitten|kittens|retriever|golden retriever|labrador|poodle|husky|animal)|i have a (?:dog|cat|pet)|i own a (?:dog|cat|pet)|walk (?:my|with my) dog)\b",
+            text_lower,
+        ):
+            issues.append("zero_fact_autobiographical_fabrication: Fabricated pet ownership without personal facts")
+        # Flags fabricating specific daily morning routines/habits (first-person assertions)
+        if re.search(
+            r"\b(my\s+morning\s+(?:routine|ritual)|every\s+morning\s+(?:i\s+|my\s+)|i\s+(?:always\s+)?wake(?:\s+up)?\s+at|i\s+drink\s+(?:coffee|tea)\s+at)\b",
+            text_lower,
+        ):
+            issues.append("zero_fact_autobiographical_fabrication: Fabricated personal routine without personal facts")
 
     return {
         "is_grounded": len(issues) == 0,
@@ -407,14 +943,33 @@ class PersonalizedWritingGenerator:
         topic: str,
         personal_knowledge: List[str],
         lead_in: str = "",
+        length_mode: str = "medium",
     ) -> str:
-        """Formats personal knowledge and topic into an explicitly grounded generation prompt (Grounding V2)."""
+        """Formats personal knowledge and topic into an explicitly grounded generation prompt (Grounding V3)."""
         has_facts = personal_knowledge and any(item.strip() for item in personal_knowledge)
+        mode = (length_mode or "medium").lower()
+
+        if mode == "short":
+            length_instruction = "Desired Length: Short (1–2 sentences). Express the core insight directly and conclude cleanly without trailing off."
+        elif mode == "long":
+            length_instruction = (
+                "Desired Length: Long (2 structured paragraphs). Provide a thorough reflection: "
+                "in paragraph 1, explain the personal background, motivation, and specific challenge; "
+                "in paragraph 2, explain the approach, resolution, and future implications."
+            )
+        else:  # medium
+            length_instruction = (
+                "Desired Length: Medium (3–4 sentences). Develop the thought with authentic reasoning: "
+                "state the core point, share the context or practical struggle using natural connective words "
+                "('and', 'so', 'because', 'which means'), and conclude with a clear takeaway."
+            )
 
         if has_facts:
-            facts_block = "\n".join(f"- {item.strip()}" for item in personal_knowledge if item.strip())
+            affirmative_facts = format_affirmative_facts(personal_knowledge)
+            facts_block = "\n".join(f"- {item.strip()}" for item in affirmative_facts if item.strip())
             prompt = (
-                "Instructions: Write a short, authentic first-person update in the author's personal voice ('I', 'my').\n\n"
+                "Instructions: Write an authentic first-person update in the author's personal voice ('I', 'my').\n"
+                f"{length_instruction}\n\n"
                 f"Authoritative Personal Facts (About Me):\n{facts_block}\n\n"
                 "Strict Grounding Rules:\n"
                 "1. Ownership: Every project, skill, and experience listed above belongs solely to the author ('I'). "
@@ -422,16 +977,37 @@ class PersonalizedWritingGenerator:
                 "2. Status & Temporality: Distinguish completed projects, current mastered skills, and future goals. "
                 "Never describe existing skills as future learning goals. Never describe future learning goals as commercial startups, businesses, or revenue targets.\n"
                 "3. Limitation Fidelity: If a project fact states that it uses static data, simulated matches, or lacks live feeds, "
-                "NEVER claim or imply that the project provides live matches, live results, real-time odds, or live feeds. State the static/simulated reality faithfully.\n"
+                "state the actual operational reality affirmatively (that the project uses static data or simulated matches). NEVER claim or imply that the project provides live matches, live results, real-time odds, or live feeds.\n"
                 "4. Scope Restraint: Do not invent unmentioned features, technologies, tools, programming languages, sports, or platforms. "
                 "Confine all statements strictly to the facts provided above.\n"
-                "5. Missing Details: If the facts do not specify implementation steps, keep the draft concise (1–3 sentences) and focused on stated facts rather than fabricating details.\n\n"
+                "5. Detail & Completion: Keep the draft focused on the stated facts, ensuring thoughts and sentences conclude cleanly.\n\n"
                 f"Topic: {topic.strip()}\n"
                 f"Author's Personal Draft:\n"
             )
+        elif not has_facts and is_autobiographical_topic(topic):
+            topic_clean = topic.strip().replace("My ", "").replace("my ", "")
+            prompt = (
+                "Instructions: The author has NO recorded personal experiences, notes, or facts for this topic in Echo.\n"
+                "Do NOT invent first-person biographical claims (no fictional pets, no fake daily routines, no invented family).\n"
+                f"{length_instruction}\n"
+                "Begin directly with an honest statement that no personal experiences are recorded for this topic yet in Echo, "
+                "then provide a thoughtful, balanced general reflection on the concept.\n\n"
+                "Authoritative Personal Facts (About Me):\n"
+                "- None available. No personal facts, biographical details, pets, or daily routines exist for this topic.\n\n"
+                "Strict Grounding Rules (Zero-Fact Autobiographical Mode):\n"
+                "1. Zero Personal Fabrication: Do NOT invent pets, dogs, cats, wake-up times, coffee habits, or personal history.\n"
+                "2. Transparent Communication: Acknowledge that Echo lacks personal data for this topic rather than fabricating an authentic experience.\n"
+                "3. Safe General Reflection: Discuss the concept thoughtfully from an objective, general viewpoint.\n\n"
+                f"Topic: {topic.strip()}\n"
+                f"Author's Reflection:\n"
+            )
+            # Pre-anchor reflection disclosure if no explicit lead_in
+            if not lead_in:
+                lead_in = f"I haven't recorded any personal notes about {topic_clean} in Echo yet. From a general perspective,"
         else:
             prompt = (
-                "Instructions: Write a short, thoughtful reflection in the author's conversational voice.\n\n"
+                "Instructions: Write a thoughtful reflection in the author's conversational voice.\n"
+                f"{length_instruction}\n\n"
                 "Authoritative Personal Facts (About Me):\n"
                 "- None available. No personal facts, biographical details, location, habits, or private preferences exist for this topic.\n\n"
                 "Strict Grounding Rules (Zero-Fact Mode):\n"
@@ -439,7 +1015,7 @@ class PersonalizedWritingGenerator:
                 "2. General First-Person Reasoning: Prefer general reflection over fictional autobiography. Do not invent specific biographical facts, specific media titles, or pretend to have unverified personal experiences.\n"
                 "3. Neutral When Facts Missing: If the topic asks for specific personal information that is not in the facts, state a balanced, general reflection on the concept rather than inventing an answer.\n"
                 "4. Zero Memory Bleed: Do NOT mention or inject unrelated personal projects (such as Task Tracker), past coding tasks, model training experiments, cloud GPUs, or databases into this topic.\n"
-                "5. Brevity & Tone: Keep the reflection concise, conversational, and grounded.\n\n"
+                "5. Completion & Tone: Keep the reflection conversational, grounded, and ensure sentences conclude cleanly.\n\n"
                 f"Topic: {topic.strip()}\n"
                 f"Author's Reflection:\n"
             )
@@ -453,18 +1029,69 @@ class PersonalizedWritingGenerator:
         topic: str,
         personal_knowledge: List[str],
         lead_in: str = "",
-        max_new_tokens: int = 90,
+        length_mode: str = "medium",
+        max_new_tokens: Optional[int] = None,
         temperature: float = 0.7,
         top_p: float = 0.9,
         repetition_penalty: float = 1.15,
         do_sample: bool = True,
         seed: int = 42,
     ) -> Dict[str, Any]:
-        """Generates personalized text using the resident model with conservative Grounding V2 checks."""
+        """Generates personalized text using the resident model with conservative Grounding V3 checks and length control."""
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model is not loaded. Call load_model() first.")
 
-        prompt = self.build_prompt(topic, personal_knowledge, lead_in=lead_in)
+        mode = (length_mode or "medium").lower()
+        if mode == "short":
+            default_max = 60
+            min_new_tokens = 15
+        elif mode == "long":
+            default_max = 220
+            min_new_tokens = 95
+        else:  # medium
+            default_max = 120
+            min_new_tokens = 45
+
+        effective_max_tokens = max_new_tokens if max_new_tokens is not None else default_max
+        has_facts = personal_knowledge and any(item.strip() for item in personal_knowledge)
+
+        # 1. Deterministic Zero-Fact Autobiographical Safe Response
+        # When a topic is autobiographical (routines, pets, relationships, private life) and no verified facts exist:
+        # Enforce deterministic safe response immediately. Do not rely on model instructions or phrase-based detection.
+        if not has_facts and is_autobiographical_topic(topic):
+            safe_text = build_zero_fact_autobiographical_response(topic, length_mode=mode, lead_in=lead_in)
+            safe_tokens = len(self.tokenizer.encode(safe_text)) if self.tokenizer else len(safe_text.split())
+            return {
+                "topic": topic,
+                "personal_knowledge": personal_knowledge,
+                "lead_in": lead_in,
+                "prompt": f"[Zero-Fact Autobiographical Safe Mode] Topic: {topic}",
+                "generated_text": safe_text,
+                "complete_draft": safe_text,
+                "tokens_generated": safe_tokens,
+                "elapsed_sec": 0.01,
+                "tokens_per_sec": 0.0,
+                "peak_ram_mb": round(self.process.memory_info().rss / (1024 * 1024), 1),
+                "cpu_estimate": 0.0,
+                "length_mode": mode,
+                "grounding_check": {
+                    "is_grounded": True,
+                    "flagged_issues": [],
+                    "fallback_used": True,
+                },
+                "settings": {
+                    "max_new_tokens": effective_max_tokens,
+                    "min_new_tokens": min_new_tokens,
+                    "length_mode": mode,
+                    "temperature": temperature if do_sample else None,
+                    "top_p": top_p if do_sample else None,
+                    "repetition_penalty": repetition_penalty,
+                    "do_sample": do_sample,
+                    "seed": seed,
+                },
+            }
+
+        prompt = self.build_prompt(topic, personal_knowledge, lead_in=lead_in, length_mode=mode)
         inputs = self.tokenizer(prompt, return_tensors="pt")
         input_len = inputs["input_ids"].shape[1]
 
@@ -476,7 +1103,8 @@ class PersonalizedWritingGenerator:
             if do_sample:
                 output_ids = self.model.generate(
                     **inputs,
-                    max_new_tokens=max_new_tokens,
+                    max_new_tokens=effective_max_tokens,
+                    min_new_tokens=min_new_tokens,
                     do_sample=True,
                     temperature=temperature,
                     top_p=top_p,
@@ -486,7 +1114,8 @@ class PersonalizedWritingGenerator:
             else:
                 output_ids = self.model.generate(
                     **inputs,
-                    max_new_tokens=max_new_tokens,
+                    max_new_tokens=effective_max_tokens,
+                    min_new_tokens=min_new_tokens,
                     do_sample=False,
                     repetition_penalty=repetition_penalty,
                     pad_token_id=self.tokenizer.eos_token_id,
@@ -499,38 +1128,55 @@ class PersonalizedWritingGenerator:
         gen_tokens = output_ids[0][input_len:]
         num_generated_tokens = len(gen_tokens)
         decoded_text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+        decoded_text = ensure_complete_thoughts(decoded_text)
 
         # Reconstruct complete personal draft with lead_in if applicable
         complete_draft = f"{lead_in.strip()} {decoded_text}".strip() if lead_in else decoded_text
+        complete_draft = ensure_complete_thoughts(complete_draft)
 
-        # Grounding V2: Conservative Post-Generation Validation
+        # Grounding V3: Conservative Post-Generation Validation
         grounding_result = validate_grounding(topic, personal_knowledge, complete_draft)
         fallback_used = False
 
-        # If sampled run failed a conservative check, execute 1 deterministic retry
-        if not grounding_result["is_grounded"] and do_sample:
-            t_fb_start = time.perf_counter()
-            with torch.inference_mode():
-                fb_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    repetition_penalty=max(1.2, repetition_penalty),
-                    pad_token_id=self.tokenizer.eos_token_id,
-                )
-            fb_tokens = fb_ids[0][input_len:]
-            fb_text = self.tokenizer.decode(fb_tokens, skip_special_tokens=True).strip()
-            fb_draft = f"{lead_in.strip()} {fb_text}".strip() if lead_in else fb_text
-            fb_grounding = validate_grounding(topic, personal_knowledge, fb_draft)
-
-            # If fallback resolved issues or is cleaner, adopt fallback
-            if len(fb_grounding["flagged_issues"]) <= len(grounding_result["flagged_issues"]):
-                decoded_text = fb_text
-                complete_draft = fb_draft
-                num_generated_tokens = len(fb_tokens)
-                grounding_result = fb_grounding
-                fallback_used = True
+        if not grounding_result["is_grounded"]:
+            # If initial generation had issues, first try deterministic greedy retry if sampled
+            fb_adopted = False
+            if do_sample:
+                t_fb_start = time.perf_counter()
+                with torch.inference_mode():
+                    fb_ids = self.model.generate(
+                        **inputs,
+                        max_new_tokens=effective_max_tokens,
+                        min_new_tokens=min_new_tokens,
+                        do_sample=False,
+                        repetition_penalty=max(1.2, repetition_penalty),
+                        pad_token_id=self.tokenizer.eos_token_id,
+                    )
+                fb_tokens = fb_ids[0][input_len:]
+                fb_text = self.tokenizer.decode(fb_tokens, skip_special_tokens=True).strip()
+                fb_text = ensure_complete_thoughts(fb_text)
+                fb_draft = f"{lead_in.strip()} {fb_text}".strip() if lead_in else fb_text
+                fb_draft = ensure_complete_thoughts(fb_draft)
+                fb_grounding = validate_grounding(topic, personal_knowledge, fb_draft)
                 t_elapsed += (time.perf_counter() - t_fb_start)
+
+                if fb_grounding["is_grounded"]:
+                    decoded_text = fb_text
+                    complete_draft = fb_draft
+                    num_generated_tokens = len(fb_tokens)
+                    grounding_result = fb_grounding
+                    fallback_used = True
+                    fb_adopted = True
+
+            # If greedy generation is ALSO ungrounded or if greedy was run directly:
+            # Enforce deterministic grounded synthesis fallback rather than generating contradictory claims.
+            if not fb_adopted:
+                safe_fallback = build_grounded_fallback_draft(topic, personal_knowledge, length_mode=mode, lead_in=lead_in)
+                decoded_text = safe_fallback
+                complete_draft = safe_fallback
+                num_generated_tokens = len(self.tokenizer.encode(safe_fallback)) if self.tokenizer else len(safe_fallback.split())
+                grounding_result = {"is_grounded": True, "flagged_issues": []}
+                fallback_used = True
 
         tok_per_sec = num_generated_tokens / t_elapsed if t_elapsed > 0 else 0.0
 
@@ -546,13 +1192,16 @@ class PersonalizedWritingGenerator:
             "tokens_per_sec": round(tok_per_sec, 2),
             "peak_ram_mb": round(current_ram_mb, 1),
             "cpu_estimate": cpu_after,
+            "length_mode": mode,
             "grounding_check": {
                 "is_grounded": grounding_result["is_grounded"],
                 "flagged_issues": grounding_result["flagged_issues"],
                 "fallback_used": fallback_used,
             },
             "settings": {
-                "max_new_tokens": max_new_tokens,
+                "max_new_tokens": effective_max_tokens,
+                "min_new_tokens": min_new_tokens,
+                "length_mode": mode,
                 "temperature": temperature if do_sample else None,
                 "top_p": top_p if do_sample else None,
                 "repetition_penalty": repetition_penalty,

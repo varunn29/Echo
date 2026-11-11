@@ -15,11 +15,14 @@ export interface GenerationServiceHealth {
   error?: string;
 }
 
+export type GenerationLengthMode = 'short' | 'medium' | 'long';
+
 export interface GenerationRequest {
   topic: string;
   personalKnowledge?: string[];
   leadIn?: string;
   mode?: 'sampled' | 'greedy';
+  lengthMode?: GenerationLengthMode;
   maxTokens?: number;
   temperature?: number;
   repetitionPenalty?: number;
@@ -29,6 +32,7 @@ export interface GenerationRequest {
 export interface GenerationMetadata {
   topic: string;
   mode: string;
+  lengthMode?: string;
   model: string;
   adapter: string;
   repetitionPenalty: number;
@@ -174,7 +178,8 @@ export async function generatePersonalizedDraft(
       personalKnowledge: knowledge,
       leadIn: leadIn,
       mode: request.mode ?? 'sampled',
-      maxTokens: request.maxTokens ?? 85,
+      lengthMode: request.lengthMode ?? 'medium',
+      maxTokens: request.maxTokens,
       temperature: request.temperature ?? 0.65,
       repetitionPenalty: request.repetitionPenalty ?? 1.15,
       seed: request.seed ?? 42,

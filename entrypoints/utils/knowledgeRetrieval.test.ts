@@ -11,6 +11,8 @@ import {
 import {
   extractTopicKeywords,
   formatKnowledgeItemForGeneration,
+  formatAffirmativeConstraint,
+  isAutobiographicalTopic,
   retrieveRelevantKnowledge,
   scoreKnowledgeItem,
 } from './knowledgeRetrieval';
@@ -84,7 +86,7 @@ describe('Personal Knowledge Retrieval Engine V1', () => {
       );
     });
 
-    it('formats project limitations into explicit first-person constraints', () => {
+    it('formats project limitations into affirmative descriptions of actual reality', () => {
       const item: PersonalKnowledgeItem = {
         category: 'projects',
         subject: 'Task Tracker',
@@ -102,7 +104,7 @@ describe('Personal Knowledge Retrieval Engine V1', () => {
 
       const formatted = formatKnowledgeItemForGeneration(item);
       expect(formatted).toBe(
-        '[Project Constraint & Reality]: For my project Task Tracker, could not get real-time websocket access, so built an offline sync queue. (Strict reality: This is an offline/static simulation; never claim live, real-time, or external feed connectivity.)'
+        '[Project Architecture & Reality]: Task Tracker currently operates as an offline sync queue. It does not have real-time websocket access or live external sync.'
       );
     });
 
@@ -341,6 +343,92 @@ describe('Personal Knowledge Retrieval Engine V1', () => {
       expect(res.items.length).toBe(2);
       expect(res.items[0]!.id).toBe(idPrimary);
       expect(res.items[1]!.id).toBe(idIncidental);
+    });
+
+    it('identifies autobiographical topics lacking personal facts and provides safety notice', async () => {
+      const res = await retrieveRelevantKnowledge('My daily morning routine and coffee habits', testDb);
+
+      expect(res.hasRelevantKnowledge).toBe(false);
+      expect(res.isAutobiographicalWithoutFacts).toBe(true);
+      expect(res.safetyNotice).toContain('No verified personal notes exist');
+    });
+
+    it('does not flag general conceptual topics as autobiographical without facts', async () => {
+      const res = await retrieveRelevantKnowledge('Why I prefer learning by building projects', testDb);
+
+      expect(res.hasRelevantKnowledge).toBe(false);
+      expect(res.isAutobiographicalWithoutFacts).toBe(false);
+      expect(res.safetyNotice).toBeUndefined();
+    });
+  });
+
+  describe('Affirmative Constraint Formatting & Negation Handling', () => {
+    it('expresses static vs live functionality affirmatively for Match Point', () => {
+      const raw = 'could not get live match data, so built a static version where matches never end';
+      const formatted = formatAffirmativeConstraint('Match Point', raw);
+
+      expect(formatted).toBe(
+        'Match Point currently uses static match data and simulated match progression. It does not have live match connectivity.'
+      );
+      expect(formatted).not.toContain('could not');
+      expect(formatted).toContain('currently uses static match data');
+    });
+
+    it('expresses offline sync vs websocket functionality affirmatively for Task Tracker', () => {
+      const raw = 'could not get real-time websocket access, so built an offline sync queue';
+      const formatted = formatAffirmativeConstraint('Task Tracker', raw);
+
+      expect(formatted).toBe(
+        'Task Tracker currently operates as an offline sync queue. It does not have real-time websocket access or live external sync.'
+      );
+    });
+
+    it('handles general could-not-get X so-built Y patterns without inventing features', () => {
+      const raw = 'unable to access cloud postgres, so implemented local indexeddb storage';
+      const formatted = formatAffirmativeConstraint('LocalNotes', raw);
+
+      expect(formatted).toBe(
+        'LocalNotes currently uses local indexeddb storage. It does not have cloud postgres connectivity.'
+      );
+    });
+
+    it('handles raw negation strings safely while preserving boundaries', () => {
+      const raw = 'lacks automated cloud backup';
+      const formatted = formatAffirmativeConstraint('UtilityApp', raw);
+
+      expect(formatted).toContain('actual reality: operates as a local or static implementation without automated cloud backup.');
+    });
+  });
+
+  describe('isAutobiographicalTopic', () => {
+    it('detects daily routines and habits', () => {
+      expect(isAutobiographicalTopic('My daily morning routine and coffee habits')).toBe(true);
+      expect(isAutobiographicalTopic('My morning routine')).toBe(true);
+      expect(isAutobiographicalTopic('My evening routine')).toBe(true);
+      expect(isAutobiographicalTopic('How I spend my mornings')).toBe(true);
+    });
+
+    it('detects pets and personal life', () => {
+      expect(isAutobiographicalTopic('My experience with owning pets')).toBe(true);
+      expect(isAutobiographicalTopic('My experience with pets')).toBe(true);
+      expect(isAutobiographicalTopic('My pet dog')).toBe(true);
+      expect(isAutobiographicalTopic('My childhood memories')).toBe(true);
+      expect(isAutobiographicalTopic('Where I grew up and my hometown')).toBe(true);
+    });
+
+    it('returns false for general conceptual questions about pets and routines', () => {
+      expect(isAutobiographicalTopic('Why do people keep pets?')).toBe(false);
+      expect(isAutobiographicalTopic('Why are morning routines useful?')).toBe(false);
+      expect(isAutobiographicalTopic('Benefits of morning routines')).toBe(false);
+      expect(isAutobiographicalTopic('The history of domestic pets')).toBe(false);
+    });
+
+    it('returns false for general, conceptual, and technical topics', () => {
+      expect(isAutobiographicalTopic('Why I prefer learning by building projects rather than just reading documentation')).toBe(false);
+      expect(isAutobiographicalTopic('My thoughts on remote work and collaborating across different time zones')).toBe(false);
+      expect(isAutobiographicalTopic('Why writing automated tests for every feature saves time in the long run')).toBe(false);
+      expect(isAutobiographicalTopic('IndexedDB')).toBe(false);
+      expect(isAutobiographicalTopic('Why user chat data should stay stored locally in the browser')).toBe(false);
     });
   });
 });
