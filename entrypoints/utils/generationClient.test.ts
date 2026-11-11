@@ -121,8 +121,16 @@ describe('Echo Generation Service Client', () => {
       const mockResponse = {
         completeDraft: 'Over the last few months, I built Task Tracker using React and TypeScript.',
         generatedText: 'I built Task Tracker using React and TypeScript.',
+        rawGeneratedText: 'I built Task Tracker using React and TypeScript.',
         leadIn: 'Over the last few months, ',
         tokensGenerated: 45,
+        tokenCount: 45,
+        finalTokenCount: 45,
+        rawTokenCount: 45,
+        wordCount: 12,
+        sentenceCount: 1,
+        paragraphCount: 1,
+        source: 'lora_sampled',
         elapsedSec: 1.15,
         tokensPerSec: 39.1,
         peakRamMb: 3750.2,
@@ -133,6 +141,11 @@ describe('Echo Generation Service Client', () => {
           adapter: 'training-output/qwen3.5-0.8b-lora-v2',
           repetitionPenalty: 1.15,
           maxTokens: 85,
+          source: 'lora_sampled',
+          seed: 42,
+          tokenCount: 45,
+          finalTokenCount: 45,
+          rawTokenCount: 45,
         },
       };
 
@@ -149,9 +162,20 @@ describe('Echo Generation Service Client', () => {
 
       expect(res.completeDraft).toBe(mockResponse.completeDraft);
       expect(res.generatedText).toBe(mockResponse.generatedText);
+      expect(res.rawGeneratedText).toBe(mockResponse.rawGeneratedText);
       expect(res.tokensGenerated).toBe(45);
+      expect(res.tokenCount).toBe(45);
+      expect(res.finalTokenCount).toBe(45);
+      expect(res.rawTokenCount).toBe(45);
+      expect(res.wordCount).toBe(12);
+      expect(res.sentenceCount).toBe(1);
+      expect(res.paragraphCount).toBe(1);
+      expect(res.source).toBe('lora_sampled');
       expect(res.elapsedSec).toBe(1.15);
       expect(res.metadata?.adapter).toContain('lora-v2');
+      expect(res.metadata?.tokenCount).toBe(45);
+      expect(res.metadata?.finalTokenCount).toBe(45);
+      expect(res.metadata?.rawTokenCount).toBe(45);
     });
 
     it('throws user-friendly error on HTTP 503 model loading', async () => {

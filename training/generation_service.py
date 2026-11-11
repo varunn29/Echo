@@ -723,16 +723,19 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
         except (ValueError, TypeError):
             repetition_penalty = 1.15
 
-        seed = payload.get("seed", 42)
-        if not isinstance(seed, int):
-            seed = 42
+        raw_seed = payload.get("seed")
+        if raw_seed is not None and isinstance(raw_seed, int):
+            seed = raw_seed
+        else:
+            seed = int(time.time() * 1000) % 100000
 
         # Serialize inference with concurrency lock to avoid CPU thrashing
         logger.info(
-            "Generating personalized draft for topic: '%s' (mode: %s, length: %s)...",
+            "Generating personalized draft for topic: '%s' (mode: %s, length: %s, seed: %d)...",
             topic.strip()[:60],
             mode,
             length_mode,
+            seed,
         )
         with generator_lock:
             try:
@@ -759,8 +762,16 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
         response_data = {
             "completeDraft": res["complete_draft"],
             "generatedText": res["generated_text"],
+            "rawGeneratedText": res.get("raw_generated_text", res["generated_text"]),
             "leadIn": res["lead_in"],
             "tokensGenerated": res["tokens_generated"],
+            "tokenCount": res.get("final_token_count", res.get("tokens_generated", 0)),
+            "finalTokenCount": res.get("final_token_count", res.get("tokens_generated", 0)),
+            "rawTokenCount": res.get("raw_token_count", res.get("tokens_generated", 0)),
+            "wordCount": res.get("word_count", len(res["complete_draft"].split())),
+            "sentenceCount": res.get("sentence_count", 1),
+            "paragraphCount": res.get("paragraph_count", 1),
+            "source": res.get("source", "lora_sampled"),
             "elapsedSec": res["elapsed_sec"],
             "tokensPerSec": res["tokens_per_sec"],
             "peakRamMb": res["peak_ram_mb"],
@@ -777,6 +788,11 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
                 "adapter": generator.adapter_path,
                 "repetitionPenalty": repetition_penalty,
                 "maxTokens": res.get("settings", {}).get("max_new_tokens", max_tokens or 85),
+                "source": res.get("source", "lora_sampled"),
+                "seed": seed,
+                "tokenCount": res.get("final_token_count", res.get("tokens_generated", 0)),
+                "finalTokenCount": res.get("final_token_count", res.get("tokens_generated", 0)),
+                "rawTokenCount": res.get("raw_token_count", res.get("tokens_generated", 0)),
             },
         }
 

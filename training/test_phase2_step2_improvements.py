@@ -13,6 +13,9 @@ from training.generate_with_adapter import (
     is_autobiographical_topic,
     is_complete_thought,
     ensure_complete_thoughts,
+    extract_sentences,
+    split_long_runon_sentences,
+    extract_opening_hook,
     build_zero_fact_autobiographical_response,
     build_grounded_fallback_draft,
     validate_grounding,
@@ -407,12 +410,339 @@ class TestUnsupportedClaimsAndStrictFidelity(unittest.TestCase):
         self.assertFalse(is_autobiographical_topic(topic))
 
         draft = (
-            "I feel that 90% of what we learn today comes from passive consumption, "
-            "which leaves us with nothing but knowledge gaps and never really understand why it works or how to apply it."
+            "I feel that learning primarily through passive consumption leaves us with nothing but knowledge gaps, "
+            "and we never really understand why tools work or how to apply them effectively."
         )
         res = validate_grounding(topic, [], draft)
         self.assertTrue(res["is_grounded"])
         self.assertEqual(len(res["flagged_issues"]), 0)
+
+
+class TestStep3UniversalPersonalClaimGrounding(unittest.TestCase):
+    """Step 3 regression tests preventing unsupported personal and family claims across all topics."""
+
+    def test_family_hallucination_on_technical_topic_flagged(self):
+        """Web development learning topic must flag invented parental backstories when no family facts exist."""
+        facts = [
+            "Learned: HTML, CSS, JavaScript, React, TypeScript, Tailwind, Node.js, Express.js, PostgreSQL",
+            "Next plan: move ahead to learn AI, machine learning, and cloud technologies",
+        ]
+        topic = "My background in web development and moving to newer technologies"
+
+        # Audit Scenario 3 hallucination 1: "my parents were always teaching me how things work"
+        bad_draft_1 = (
+            "I started by learning HTML, CSS, JavaScript, React, TypeScript, and PostgreSQL for web development "
+            "since my parents were always teaching me how things work."
+        )
+        res_1 = validate_grounding(topic, facts, bad_draft_1)
+        self.assertFalse(res_1["is_grounded"])
+        self.assertTrue(any("unsupported_personal_claim" in i for i in res_1["flagged_issues"]))
+
+        # Audit Scenario 3 hallucination 2: "because my parents always told me they wanted me to build something useful online so I could make money with them later"
+        bad_draft_2 = (
+            "I learned web development because my parents always told me they wanted me to build something useful online "
+            "so I could make money with them later."
+        )
+        res_2 = validate_grounding(topic, facts, bad_draft_2)
+        self.assertFalse(res_2["is_grounded"])
+        self.assertTrue(any("unsupported_personal_claim" in i for i in res_2["flagged_issues"]))
+
+    def test_legitimate_family_claims_preserved_when_verified_facts_exist(self):
+        """When verified personal facts explicitly support family background, claims pass validation."""
+        facts = [
+            "Category: background | Learned programming because my father was a software engineer who taught me the basics",
+            "Category: skills | Learned React and TypeScript",
+        ]
+        topic = "My background in web development"
+
+        supported_draft = (
+            "I began learning software development because my father was a software engineer who taught me the fundamentals early on, "
+            "which led me to learn React and TypeScript."
+        )
+        res = validate_grounding(topic, facts, supported_draft)
+        self.assertTrue(res["is_grounded"])
+        self.assertEqual(len(res["flagged_issues"]), 0)
+
+    def test_upbringing_and_childhood_hallucinations_flagged_without_facts(self):
+        """Upbringing or childhood history claims are rejected when no supporting facts exist."""
+        facts = ["Learned: React, TypeScript, Python"]
+        topic = "How I approach software engineering"
+
+        childhood_draft = (
+            "Growing up in my childhood, I always spent hours taking mechanical toys apart to see how they functioned."
+        )
+        res = validate_grounding(topic, facts, childhood_draft)
+        self.assertFalse(res["is_grounded"])
+        self.assertTrue(any("unsupported_personal_claim" in i for i in res["flagged_issues"]))
+
+    def test_legitimate_childhood_claims_pass_with_facts(self):
+        """Upbringing claims pass when supported by verified personal knowledge."""
+        facts = [
+            "Category: childhood | Growing up in Chicago, I spent my childhood tinkering with electronics",
+            "Category: skills | Learned Python and React",
+        ]
+        topic = "How I got into technology"
+
+        valid_draft = (
+            "Growing up in my childhood, I spent time tinkering with electronics before moving on to learn Python and React."
+        )
+        res = validate_grounding(topic, facts, valid_draft)
+        self.assertTrue(res["is_grounded"])
+        self.assertEqual(len(res["flagged_issues"]), 0)
+
+    def test_living_arrangements_hallucination_flagged_without_facts(self):
+        """Living arrangements or roommate claims are rejected when not in facts."""
+        facts = ["Learned: React, TypeScript"]
+        topic = "My daily workflow"
+
+        domestic_draft = (
+            "I usually code late at night in my apartment while living with my roommate."
+        )
+        res = validate_grounding(topic, facts, domestic_draft)
+        self.assertFalse(res["is_grounded"])
+        self.assertTrue(any("unsupported_personal_claim" in i for i in res["flagged_issues"]))
+
+    def test_exact_web_development_unsupported_learning_history_flagged(self):
+        """Exact Web Development example from audit: unsupported beginner state and lack of coding knowledge."""
+        facts = [
+            "Learned: HTML, CSS, JavaScript, React, TypeScript, Tailwind, Node.js, Express.js, PostgreSQL",
+            "Next plan: move ahead to learn AI, machine learning, and cloud technologies",
+        ]
+        topic = "My background in web development and moving to newer technologies"
+
+        # The exact audited hallucination:
+        bad_draft = (
+            "I started by building websites from scratch since I have no coding knowledge at all, "
+            "and gradually learned HTML, CSS, JavaScript, React, TypeScript, and PostgreSQL."
+        )
+        res = validate_grounding(topic, facts, bad_draft)
+        self.assertFalse(res["is_grounded"])
+        self.assertTrue(
+            any("Claimed starting state, lack of knowledge, or beginner status" in i for i in res["flagged_issues"]),
+            f"Expected learning history flag, got: {res['flagged_issues']}",
+        )
+
+    def test_unsupported_struggles_and_website_achievements_flagged_despite_skills_fact(self):
+        """Listing technical skills does NOT permit inventing beginner struggles, template dilemmas, or website achievements."""
+        facts = [
+            "Learned: HTML, CSS, JavaScript, React, TypeScript, Tailwind, Node.js, Express.js, PostgreSQL",
+            "Next plan: move ahead to learn AI, machine learning, and cloud technologies",
+        ]
+        topic = "My background in web development and moving to newer technologies"
+
+        # Hallucinated struggle/dilemma
+        struggle_draft = (
+            "When I started coding, I found myself stuck because templates available online don't match my vision, "
+            "so I learned React and TypeScript."
+        )
+        res_struggle = validate_grounding(topic, facts, struggle_draft)
+        self.assertFalse(res_struggle["is_grounded"])
+        self.assertTrue(any("Invented learning struggle, obstacle, or personal dilemma" in i for i in res_struggle["flagged_issues"]))
+
+        # Hallucinated achievements / outcomes
+        achievement_draft = (
+            "I learned web development and built some of my favorite websites in order to impress my mentors and land my first job."
+        )
+        res_achievement = validate_grounding(topic, facts, achievement_draft)
+        self.assertFalse(res_achievement["is_grounded"])
+        self.assertTrue(any("Invented personal achievement, outcome, or motivation" in i for i in res_achievement["flagged_issues"]))
+
+    def test_supported_learning_history_and_struggles_pass_when_present_in_facts(self):
+        """When verified personal knowledge explicitly documents beginner status or struggles, claims pass validation."""
+        facts = [
+            "Category: background | Started learning web development from scratch with no prior coding experience",
+            "Category: learning | Faced challenges when website templates available online did not match my vision",
+            "Category: projects | Built some of my favorite websites to showcase my frontend work",
+            "Category: skills | Learned React and TypeScript",
+        ]
+        topic = "My background in web development"
+
+        supported_draft = (
+            "I started learning web development from scratch with no prior coding experience, "
+            "especially when templates available online did not match my vision, which motivated me to learn React and TypeScript. "
+            "Later on, I built some of my favorite websites using these tools."
+        )
+        res = validate_grounding(topic, facts, supported_draft)
+        self.assertTrue(res["is_grounded"])
+        self.assertEqual(len(res["flagged_issues"]), 0)
+
+
+class TestStep3LongModeSentenceReadability(unittest.TestCase):
+    """Step 3 regression tests for safe clausal splitting of long run-on sentences (>35 words)."""
+
+    def test_72_word_runon_from_scenario_2_safely_split(self):
+        """The 72-word run-on sentence from Scenario 2 Long mode is cleanly split into complete thoughts."""
+        s2_runon = (
+            "Task Tracker operates without relying on continuous internet connectivity by queuing task updates locally until a connection is restored so the application can sync seamlessly, "
+            "and because of this offline-first architecture, users can continue tracking their daily tasks and managing their productivity without disruption even during intermittent network outages or complete disconnection, "
+            "which makes the entire workflow reliable and resilient."
+        )
+        split_result = split_long_runon_sentences(s2_runon, max_words=35)
+        sentences = extract_sentences(split_result)
+
+        # Must be broken into at least 2 complete sentences
+        self.assertGreaterEqual(len(sentences), 2)
+        for s in sentences:
+            # Every resulting sentence must be a complete thought
+            is_comp, reason = is_complete_thought(s)
+            self.assertTrue(is_comp, f"Split sentence '{s}' must be complete (failed: {reason})")
+            # Word count should be well under the original 72 words
+            self.assertLess(len(s.split()), 40)
+
+        # Check core content preservation
+        self.assertIn("Task Tracker", split_result)
+        self.assertIn("offline-first architecture", split_result)
+        self.assertIn("reliable and resilient", split_result)
+
+    def test_split_because_and_so(self):
+        """Sentence >35 words with ', because of ... , so ...' safely splits into complete thoughts."""
+        sentence = (
+            "I decided to build Task Tracker completely offline-first, because of the frequent network drops in my area, "
+            "so users can seamlessly capture their thoughts and synchronize them whenever a stable connection returns."
+        )
+        self.assertGreater(len(sentence.split()), 30)
+        result = split_long_runon_sentences(sentence, max_words=20)
+        sentences = extract_sentences(result)
+        self.assertGreaterEqual(len(sentences), 2)
+        for s in sentences:
+            is_comp, reason = is_complete_thought(s)
+            self.assertTrue(is_comp, f"Sentence '{s}' must be a complete thought: {reason}")
+
+    def test_split_but_and_and(self):
+        """Sentence >35 words with ', and ... , but ...' safely splits into complete thoughts."""
+        sentence = (
+            "Building local-first applications requires careful synchronization handling across client storage engines, "
+            "and storing data in IndexedDB keeps everything responsive for the user, but handling conflict resolution requires meticulous care."
+        )
+        self.assertGreater(len(sentence.split()), 25)
+        result = split_long_runon_sentences(sentence, max_words=20)
+        sentences = extract_sentences(result)
+        self.assertGreaterEqual(len(sentences), 2)
+        for s in sentences:
+            is_comp, reason = is_complete_thought(s)
+            self.assertTrue(is_comp, f"Sentence '{s}' must be a complete thought: {reason}")
+
+    def test_split_which_means_and_which_makes(self):
+        """Sentence >35 words with ', which means ...' and ', which makes ...' safely splits into complete thoughts."""
+        sentence = (
+            "Match Point operates entirely on static data fixtures and simulated match progression without network access, "
+            "which means the platform never fails on dropped external requests, which makes the entire testing workflow exceptionally predictable."
+        )
+        self.assertGreater(len(sentence.split()), 25)
+        result = split_long_runon_sentences(sentence, max_words=20)
+        sentences = extract_sentences(result)
+        self.assertGreaterEqual(len(sentences), 2)
+        for s in sentences:
+            is_comp, reason = is_complete_thought(s)
+            self.assertTrue(is_comp, f"Sentence '{s}' must be a complete thought: {reason}")
+
+    def test_split_multiple_clauses(self):
+        """A 3-clause run-on sentence (>40 words) safely splits at multiple boundaries into complete thoughts."""
+        sentence = (
+            "I initially started web development by learning HTML and CSS to create simple layouts, "
+            "and later I adopted React and TypeScript to build scalable component architectures, "
+            "which means I can now quickly prototype full-stack applications with PostgreSQL on the backend."
+        )
+        self.assertGreater(len(sentence.split()), 35)
+        result = split_long_runon_sentences(sentence, max_words=18)
+        sentences = extract_sentences(result)
+        self.assertGreaterEqual(len(sentences), 2)
+        for s in sentences:
+            is_comp, reason = is_complete_thought(s)
+            self.assertTrue(is_comp, f"Sentence '{s}' must be a complete thought: {reason}")
+
+    def test_conversational_compound_sentences_under_35_words_preserved(self):
+        """Normal conversational sentences under 35 words must not be mangled or arbitrarily split."""
+        compound = "I built Task Tracker to manage productivity offline, and it syncs queued updates whenever internet connectivity returns."
+        result = split_long_runon_sentences(compound, max_words=35)
+        self.assertEqual(result, compound)
+
+    def test_sentences_with_quoted_text_do_not_split_inside_quotes(self):
+        """Sentences containing quotes must not split inside quotation marks."""
+        quoted = 'He told me, "we must build cleanly, and we should verify everything", so I followed his advice.'
+        result = split_long_runon_sentences(quoted, max_words=10)
+        # Quoted clause "we must build cleanly, and we should verify everything" must remain intact
+        self.assertIn('"we must build cleanly, and we should verify everything"', result)
+        is_comp, _ = is_complete_thought(result)
+        self.assertTrue(is_comp)
+
+    def test_sentences_with_commas_in_lists_preserved(self):
+        """Comma-separated lists must not be split."""
+        listing = "I learned HTML, CSS, JavaScript, React, TypeScript, and PostgreSQL."
+        result = split_long_runon_sentences(listing, max_words=35)
+        self.assertEqual(result, listing)
+
+    def test_unresolvable_runon_exceeding_40_words_flagged(self):
+        """A sentence exceeding 40 words without safe clausal boundaries is flagged for fallback synthesis."""
+        facts = ["I built Task Tracker"]
+        topic = "Task Tracker"
+        # 46 words with no safe clausal connectors
+        monster = (
+            "I built Task Tracker to organize everything in my daily productivity routine "
+            "because having an application where tasks are queued locally allows constant updates "
+            "without interruption or slowdown or confusion while managing multiple simultaneous projects "
+            "across various distributed computing environments and modern web browser engines."
+        )
+        res = validate_grounding(topic, facts, monster)
+        self.assertFalse(res["is_grounded"])
+        self.assertTrue(any("unreadable_runon_sentence" in i for i in res["flagged_issues"]))
+
+
+class TestStep3AntiFormulaicHooksAndAttribution(unittest.TestCase):
+    """Step 3 regression tests for anti-formulaic openings and source attribution."""
+
+    def test_statistical_percentage_opening_flagged_without_facts(self):
+        """Opening draft with '90% of what we learn today...' without percentage fact is flagged."""
+        topic = "Why I prefer learning by building projects"
+        draft = "I feel that 90% of what we learn today comes from passive reading without retention."
+        res = validate_grounding(topic, [], draft)
+        self.assertFalse(res["is_grounded"])
+        self.assertTrue(any("formulaic_hook" in i for i in res["flagged_issues"]))
+
+    def test_legitimate_percentage_in_facts_passes(self):
+        """Legitimate statistical claims supported by verified personal knowledge pass grounding."""
+        facts = ["Category: metrics | 90% of task updates are processed offline before syncing"]
+        topic = "Task Tracker offline sync performance"
+        draft = "In our performance testing, 90% of task updates are processed offline before syncing to the server."
+        res = validate_grounding(topic, facts, draft)
+        self.assertTrue(res["is_grounded"])
+        self.assertEqual(len(res["flagged_issues"]), 0)
+
+    def test_zero_fact_autobiographical_response_source_attribution(self):
+        """Zero-fact autobiographical response explicitly sets source to 'zero_fact_safe_response'."""
+        topic = "My morning routine and coffee habits"
+        resp = build_zero_fact_autobiographical_response(topic, length_mode="medium")
+        self.assertIn("haven't recorded any personal notes", resp)
+        # Word and sentence counts can be accurately computed
+        words = len(resp.split())
+        sentences = len(extract_sentences(resp))
+        self.assertGreater(words, 20)
+        self.assertGreaterEqual(sentences, 2)
+
+    def test_extract_opening_hook_normalization(self):
+        """extract_opening_hook extracts the first N normalized lowercase alphanumeric words."""
+        text = "Recently, I built Match Point — a tennis betting platform."
+        hook = extract_opening_hook(text, num_words=5)
+        self.assertEqual(hook, "recently i built match point")
+
+    def test_generator_opening_hook_tracking_and_reset(self):
+        """PersonalizedWritingGenerator tracks the last opening hook in memory and provides a reset method."""
+        gen = PersonalizedWritingGenerator()
+        self.assertIsNone(gen.last_opening_hook)
+        gen.last_opening_hook = "recently i built match point"
+        self.assertEqual(gen.last_opening_hook, "recently i built match point")
+        gen.reset_opening_hook()
+        self.assertIsNone(gen.last_opening_hook)
+
+    def test_token_and_metrics_calculation(self):
+        """Word, sentence, and paragraph metrics are distinct and properly computed."""
+        text = "First paragraph sentence one. Sentence two.\n\nSecond paragraph sentence three."
+        words = len(text.split())
+        sentences = len(extract_sentences(text))
+        paragraphs = len([p for p in text.split("\n\n") if p.strip()])
+        self.assertEqual(words, 10)
+        self.assertEqual(sentences, 3)
+        self.assertEqual(paragraphs, 2)
 
 
 if __name__ == "__main__":

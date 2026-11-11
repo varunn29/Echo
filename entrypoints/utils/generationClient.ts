@@ -37,6 +37,11 @@ export interface GenerationMetadata {
   adapter: string;
   repetitionPenalty: number;
   maxTokens: number;
+  source?: string;
+  seed?: number;
+  tokenCount?: number;
+  finalTokenCount?: number;
+  rawTokenCount?: number;
 }
 
 export interface GroundingCheckResult {
@@ -48,8 +53,16 @@ export interface GroundingCheckResult {
 export interface GenerationResponse {
   completeDraft: string;
   generatedText: string;
+  rawGeneratedText?: string;
   leadIn?: string;
   tokensGenerated?: number;
+  tokenCount?: number;
+  finalTokenCount?: number;
+  rawTokenCount?: number;
+  wordCount?: number;
+  sentenceCount?: number;
+  paragraphCount?: number;
+  source?: 'lora_sampled' | 'lora_greedy' | 'base_model' | 'zero_fact_safe_response' | 'grounded_fallback';
   elapsedSec?: number;
   tokensPerSec?: number;
   peakRamMb?: number;
@@ -210,8 +223,16 @@ export async function generatePersonalizedDraft(
       return {
         completeDraft: data.completeDraft,
         generatedText: data.generatedText ?? '',
+        rawGeneratedText: data.rawGeneratedText,
         leadIn: data.leadIn ?? '',
         tokensGenerated: data.tokensGenerated,
+        tokenCount: data.tokenCount,
+        finalTokenCount: data.finalTokenCount,
+        rawTokenCount: data.rawTokenCount,
+        wordCount: data.wordCount,
+        sentenceCount: data.sentenceCount,
+        paragraphCount: data.paragraphCount,
+        source: data.source,
         elapsedSec: data.elapsedSec,
         tokensPerSec: data.tokensPerSec,
         peakRamMb: data.peakRamMb,

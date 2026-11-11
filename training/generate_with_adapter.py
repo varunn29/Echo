@@ -257,11 +257,133 @@ def is_complete_thought(text: str) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def extract_sentences(text: str) -> List[str]:
+    """Extracts complete sentences ending in terminal punctuation."""
+    if not text or not isinstance(text, str):
+        return []
+    matches = [m.strip() for m in re.findall(r"(?:[^\s.!?][^.!?]*?[.!?][\"'”’]?)", text, flags=re.DOTALL) if m.strip()]
+    if not matches:
+        return [text.strip()] if text.strip() else []
+    return matches
+
+
+CLAUSAL_CONNECTORS = [
+    (r",\s+and\s+because\s+of\b", ". Because of "),
+    (r",\s+because\s+of\b", ". Because of "),
+    (r",\s+and\s+because\b", ". Because "),
+    (r",\s+which\s+makes\b", ". This makes "),
+    (r",\s+which\s+means\b", ". This means "),
+    (r",\s+which\s+is\s+why\b", ". This is why "),
+    (r",\s+which\s+leaves\b", ". This leaves "),
+    (r",\s+so\b", ". So "),
+    (r",\s+but\b", ". But "),
+    (r",\s+and\b", ". "),
+    (r";\s*", ". "),
+]
+
+
+def split_sentence_at_boundary(sentence: str, max_words: int = 35) -> List[str]:
+    """
+    Safely breaks a long sentence (>max_words) into complete thoughts at natural clausal boundaries.
+    Preserves:
+    - Normal conversational compound sentences under max_words.
+    - Quoted text (never splits inside quotation marks).
+    - Balanced punctuation and complete thoughts on both sides of every split.
+    """
+    words = sentence.strip().split()
+    if len(words) <= max_words:
+        return [sentence.strip()]
+
+    best_split = None
+    min_dist_from_center = float("inf")
+    center_idx = len(sentence) // 2
+
+    for pattern, replacement in CLAUSAL_CONNECTORS:
+        for match in re.finditer(pattern, sentence, re.I):
+            start = match.start()
+            end = match.end()
+
+            # Ensure split is not inside quotes
+            prefix = sentence[:start]
+            num_quotes = prefix.count('"') + prefix.count('“') + prefix.count('”')
+            if num_quotes % 2 != 0:
+                continue
+
+            left_raw = sentence[:start].strip()
+            right_raw = sentence[end:].strip()
+
+            # Format left side
+            left = left_raw.rstrip(" ,;:-") + "."
+
+            # Format right side
+            if replacement.strip() == ".":
+                if right_raw:
+                    right = right_raw[0].upper() + right_raw[1:]
+                else:
+                    right = ""
+            else:
+                prefix_clean = replacement.lstrip(". ").strip()
+                if right_raw:
+                    if right_raw.startswith("I "):
+                        right = f"{prefix_clean} {right_raw}"
+                    else:
+                        right = f"{prefix_clean} {right_raw[0].lower() + right_raw[1:]}"
+                else:
+                    right = prefix_clean
+
+            if not re.search(r'[.!?]["\'”’]?$', right):
+                right = right.rstrip(" ,;:-") + "."
+
+            # Both sides must satisfy is_complete_thought
+            left_valid, _ = is_complete_thought(left)
+            right_valid, _ = is_complete_thought(right)
+
+            if left_valid and right_valid:
+                # Minimum word count per side to prevent fragmented stubs
+                if len(left.split()) >= 4 and len(right.split()) >= 4:
+                    dist = abs(start - center_idx)
+                    if dist < min_dist_from_center:
+                        min_dist_from_center = dist
+                        best_split = (left, right)
+
+    if best_split:
+        left, right = best_split
+        left_res = split_sentence_at_boundary(left, max_words=max_words)
+        right_res = split_sentence_at_boundary(right, max_words=max_words)
+        return left_res + right_res
+
+    return [sentence.strip()]
+
+
+def split_long_runon_sentences(text: str, max_words: int = 35) -> str:
+    """
+    Detects sentences with >max_words containing excessive conjunction chains
+    and safely splits them into complete thoughts at natural clausal boundaries.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+    paragraphs = text.split("\n\n")
+    processed_paragraphs = []
+    for para in paragraphs:
+        if not para.strip():
+            continue
+        raw_sentences = extract_sentences(para.strip())
+        final_sentences = []
+        for s in raw_sentences:
+            if not s.strip():
+                continue
+            splits = split_sentence_at_boundary(s.strip(), max_words=max_words)
+            final_sentences.extend(splits)
+        processed_paragraphs.append(" ".join(final_sentences))
+    return "\n\n".join(processed_paragraphs)
+
+
 def ensure_complete_thoughts(text: str) -> str:
     """
     Cleans and trims generated text so that it concludes on a genuine, well-formed complete thought.
     - Strips leaked special tokens.
     - Balances unclosed quotation marks and parentheses.
+    - Safely splits long conjunction-heavy run-on sentences into readable complete thoughts.
     - Iteratively inspects sentences and trims back incomplete trailing clauses,
       dangling conjunctions, or dangling prepositions.
     """
@@ -279,13 +401,16 @@ def ensure_complete_thoughts(text: str) -> str:
     if num_double_quotes % 2 != 0:
         text = text + '"'
 
+    # Safely split long conjunction-heavy run-on sentences (>35 words) into complete thoughts
+    text = split_long_runon_sentences(text, max_words=35)
+
     # If the whole text is already a complete thought, return it
     is_comp, _ = is_complete_thought(text)
     if is_comp:
         return text
 
     # Sentence boundary regex: match sentences ending in [.!?]
-    sentences = re.findall(r"(?:[^\s.!?][^.!?]*?[.!?][\"'”’]?)", text, flags=re.DOTALL)
+    sentences = extract_sentences(text)
 
     # Iteratively evaluate from the end to find the last truly complete sentence
     while sentences:
@@ -681,10 +806,109 @@ def validate_grounding(
         ):
             issues.append("zero_fact_autobiographical_fabrication: Fabricated personal routine without personal facts")
 
+    # 13. Universal Unsupported Personal & Family Claims Check (enforced across ALL topics)
+    # Audits identified that technical and professional topics could hallucinate domestic/family backstories
+    # (e.g. invented parents, childhood memories, or living arrangements) when no supporting facts exist.
+    has_family_facts = any(
+        re.search(r"\b(?:parents?|father|mother|dad|mom|brother|sister|siblings?|family|cousin|grandparents?|grandfather|grandmother)\b", k, re.I)
+        for k in personal_knowledge
+    )
+    if not has_family_facts:
+        family_claim = re.search(
+            r"\b(?:my\s+(?:parents?|father|mother|dad|mom|brother|sister|siblings?|family|cousin|grandparents?|grandfather|grandmother)|(?:parents?|father|mother|dad|mom)\s+(?:were|was|always|told|wanted|taught|encouraged|supported|said|asked|made|helped|urged|advised)|with\s+my\s+parents|from\s+my\s+parents|by\s+my\s+parents|because\s+my\s+parents|since\s+my\s+parents|make\s+money\s+with\s+them)\b",
+            text_lower,
+        )
+        if family_claim:
+            issues.append("unsupported_personal_claim: Mentioned family or parental background not supported by personal facts")
+
+    has_upbringing_facts = any(
+        re.search(r"\b(?:childhood|growing up|grew up|when i was (?:a kid|young|a child)|raised in|my hometown)\b", k, re.I)
+        for k in personal_knowledge
+    )
+    if not has_upbringing_facts:
+        upbringing_claim = re.search(
+            r"\b(?:growing up|in my childhood|during my childhood|when i was (?:a kid|young|a child)|where i was raised|my childhood)\b",
+            text_lower,
+        )
+        if upbringing_claim:
+            issues.append("unsupported_personal_claim: Mentioned childhood or upbringing history not supported by personal facts")
+
+    has_domestic_facts = any(
+        re.search(r"\b(?:apartment|house|roommate|spouse|partner|wife|husband|dating)\b", k, re.I)
+        for k in personal_knowledge
+    )
+    if not has_domestic_facts:
+        domestic_claim = re.search(
+            r"\b(?:my\s+(?:apartment|house|roommate|spouse|partner|wife|husband)|living\s+with\s+(?:my\s+)?(?:parents|roommate))\b",
+            text_lower,
+        )
+        if domestic_claim:
+            issues.append("unsupported_personal_claim: Mentioned living arrangements or domestic circumstances not supported by personal facts")
+
+    has_learning_history_facts = any(
+        re.search(r"\b(?:no coding|zero knowledge|zero experience|beginner|no background|started from scratch|self-taught|prior experience)\b", k, re.I)
+        for k in personal_knowledge
+    )
+    if not has_learning_history_facts:
+        learning_history_claim = re.search(
+            r"\b(?:no (?:coding|programming|technical|prior)? (?:knowledge|experience|background)|zero (?:coding|programming|technical|prior)? (?:knowledge|experience|background)|without (?:any )?(?:coding|programming|prior) (?:knowledge|experience)|never (?:coded|programmed|built) before|complete beginner|since i have no (?:coding|technical|programming)? knowledge)\b",
+            text_lower,
+        )
+        if learning_history_claim:
+            issues.append("unsupported_personal_claim: Claimed starting state, lack of knowledge, or beginner status not supported by personal facts")
+
+    has_struggle_facts = any(
+        re.search(r"\b(?:struggl|stuck|templates?|vision|obstacle|dilemma)\b", k, re.I)
+        for k in personal_knowledge
+    )
+    if not has_struggle_facts:
+        struggle_claim = re.search(
+            r"\b(?:found myself stuck|struggled (?:with|to|for)|templates? (?:available )?online|don't match my vision|doesn't match my vision)\b",
+            text_lower,
+        )
+        if struggle_claim:
+            issues.append("unsupported_personal_claim: Invented learning struggle, obstacle, or personal dilemma not supported by personal facts")
+
+    has_achievement_facts = any(
+        re.search(r"\b(?:favorite websites?|landed|job|career|senior|lead|won|award|quit my job|impress)\b", k, re.I)
+        for k in personal_knowledge
+    )
+    if not has_achievement_facts:
+        achievement_claim = re.search(
+            r"\b(?:(?:my|some of my) favorite websites?|landed (?:my|a) (?:first )?job|became (?:a )?(?:senior|lead|professional)|won (?:a |the )?hackathon|in order to impress|quit my job)\b",
+            text_lower,
+        )
+        if achievement_claim:
+            issues.append("unsupported_personal_claim: Invented personal achievement, outcome, or motivation not supported by personal facts")
+
+    # 14. Formulaic Statistical Percentage Hook Check
+    # Audits identified repeated formulaic openings such as "90% of what we learn today..." across length modes.
+    has_percentage_fact = any("%" in k or "percent" in k.lower() for k in personal_knowledge)
+    if not has_percentage_fact:
+        first_sentence = extract_sentences(text_lower)[0] if extract_sentences(text_lower) else text_lower
+        if re.search(r"\b(?:\d{1,2}%|\d{1,2}\s+percent)\s+of\b", first_sentence):
+            issues.append("formulaic_hook: Draft began with an unverified statistical percentage hook")
+
+    # 15. Run-on Sentence Readability Check
+    # Flags any sentence that still exceeds 40 words with excessive length or conjunction chains
+    for sent in extract_sentences(draft):
+        words = sent.split()
+        if len(words) > 40:
+            issues.append(f"unreadable_runon_sentence: Sentence exceeds 40 words ({len(words)} words) with excessive length or conjunction chains")
+            break
+
     return {
         "is_grounded": len(issues) == 0,
         "flagged_issues": issues,
     }
+
+
+def extract_opening_hook(text: str, num_words: int = 5) -> str:
+    """Extracts first num_words normalized alphanumeric words from text for lightweight hook tracking."""
+    if not text or not isinstance(text, str):
+        return ""
+    words = re.findall(r"\b\w+\b", text.lower())
+    return " ".join(words[:num_words])
 
 
 class PersonalizedWritingGenerator:
@@ -720,6 +944,13 @@ class PersonalizedWritingGenerator:
         self.last_reload_time: Optional[float] = None
         self.last_reload_status: str = "initial"
         self.last_reload_error: Optional[str] = None
+
+        # Ephemeral in-memory hook tracker to detect consecutive repeated openings
+        self.last_opening_hook: Optional[str] = None
+
+    def reset_opening_hook(self) -> None:
+        """Resets the ephemeral in-memory record of the previous draft's opening hook."""
+        self.last_opening_hook = None
 
     def load_model(self) -> float:
         """Loads tokenizer, base model in FP32 on CPU, and attaches the active LoRA adapter with safe fallback."""
@@ -979,8 +1210,10 @@ class PersonalizedWritingGenerator:
                 "3. Limitation Fidelity: If a project fact states that it uses static data, simulated matches, or lacks live feeds, "
                 "state the actual operational reality affirmatively (that the project uses static data or simulated matches). NEVER claim or imply that the project provides live matches, live results, real-time odds, or live feeds.\n"
                 "4. Scope Restraint: Do not invent unmentioned features, technologies, tools, programming languages, sports, or platforms. "
-                "Confine all statements strictly to the facts provided above.\n"
-                "5. Detail & Completion: Keep the draft focused on the stated facts, ensuring thoughts and sentences conclude cleanly.\n\n"
+                "Do not invent unverified personal, family, or childhood backstories. Confine all statements strictly to the facts provided above.\n"
+                "5. Detail & Completion: Keep the draft focused on the stated facts, ensuring thoughts and sentences conclude cleanly.\n"
+                "6. Anti-Formulaic Opening: Do NOT begin with generic statistical percentages or formulaic clichés (e.g. '90% of...', 'In today's fast-paced world...'). "
+                "Express thoughts directly in authentic conversational voice.\n\n"
                 f"Topic: {topic.strip()}\n"
                 f"Author's Personal Draft:\n"
             )
@@ -997,7 +1230,8 @@ class PersonalizedWritingGenerator:
                 "Strict Grounding Rules (Zero-Fact Autobiographical Mode):\n"
                 "1. Zero Personal Fabrication: Do NOT invent pets, dogs, cats, wake-up times, coffee habits, or personal history.\n"
                 "2. Transparent Communication: Acknowledge that Echo lacks personal data for this topic rather than fabricating an authentic experience.\n"
-                "3. Safe General Reflection: Discuss the concept thoughtfully from an objective, general viewpoint.\n\n"
+                "3. Safe General Reflection: Discuss the concept thoughtfully from an objective, general viewpoint.\n"
+                "4. Anti-Formulaic Opening: Do NOT begin with generic statistical percentages or formulaic clichés (e.g. '90% of...').\n\n"
                 f"Topic: {topic.strip()}\n"
                 f"Author's Reflection:\n"
             )
@@ -1015,7 +1249,8 @@ class PersonalizedWritingGenerator:
                 "2. General First-Person Reasoning: Prefer general reflection over fictional autobiography. Do not invent specific biographical facts, specific media titles, or pretend to have unverified personal experiences.\n"
                 "3. Neutral When Facts Missing: If the topic asks for specific personal information that is not in the facts, state a balanced, general reflection on the concept rather than inventing an answer.\n"
                 "4. Zero Memory Bleed: Do NOT mention or inject unrelated personal projects (such as Task Tracker), past coding tasks, model training experiments, cloud GPUs, or databases into this topic.\n"
-                "5. Completion & Tone: Keep the reflection conversational, grounded, and ensure sentences conclude cleanly.\n\n"
+                "5. Completion & Tone: Keep the reflection conversational, grounded, and ensure sentences conclude cleanly.\n"
+                "6. Anti-Formulaic Opening: Do NOT begin with generic statistical percentages or formulaic clichés (e.g. '90% of...').\n\n"
                 f"Topic: {topic.strip()}\n"
                 f"Author's Reflection:\n"
             )
@@ -1061,14 +1296,25 @@ class PersonalizedWritingGenerator:
         if not has_facts and is_autobiographical_topic(topic):
             safe_text = build_zero_fact_autobiographical_response(topic, length_mode=mode, lead_in=lead_in)
             safe_tokens = len(self.tokenizer.encode(safe_text)) if self.tokenizer else len(safe_text.split())
+            word_count = len(safe_text.split())
+            sentence_count = len(extract_sentences(safe_text))
+            paragraph_count = len([p for p in safe_text.split("\n\n") if p.strip()])
             return {
                 "topic": topic,
                 "personal_knowledge": personal_knowledge,
                 "lead_in": lead_in,
                 "prompt": f"[Zero-Fact Autobiographical Safe Mode] Topic: {topic}",
+                "raw_generated_text": safe_text,
                 "generated_text": safe_text,
                 "complete_draft": safe_text,
                 "tokens_generated": safe_tokens,
+                "token_count": safe_tokens,
+                "final_token_count": safe_tokens,
+                "raw_token_count": safe_tokens,
+                "word_count": word_count,
+                "sentence_count": sentence_count,
+                "paragraph_count": paragraph_count,
+                "source": "zero_fact_safe_response",
                 "elapsed_sec": 0.01,
                 "tokens_per_sec": 0.0,
                 "peak_ram_mb": round(self.process.memory_info().rss / (1024 * 1024), 1),
@@ -1128,6 +1374,7 @@ class PersonalizedWritingGenerator:
         gen_tokens = output_ids[0][input_len:]
         num_generated_tokens = len(gen_tokens)
         decoded_text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+        raw_generated_text = decoded_text
         decoded_text = ensure_complete_thoughts(decoded_text)
 
         # Reconstruct complete personal draft with lead_in if applicable
@@ -1137,6 +1384,7 @@ class PersonalizedWritingGenerator:
         # Grounding V3: Conservative Post-Generation Validation
         grounding_result = validate_grounding(topic, personal_knowledge, complete_draft)
         fallback_used = False
+        source = "lora_sampled" if do_sample else "lora_greedy"
 
         if not grounding_result["is_grounded"]:
             # If initial generation had issues, first try deterministic greedy retry if sampled
@@ -1167,6 +1415,7 @@ class PersonalizedWritingGenerator:
                     grounding_result = fb_grounding
                     fallback_used = True
                     fb_adopted = True
+                    source = "lora_greedy"
 
             # If greedy generation is ALSO ungrounded or if greedy was run directly:
             # Enforce deterministic grounded synthesis fallback rather than generating contradictory claims.
@@ -1177,17 +1426,66 @@ class PersonalizedWritingGenerator:
                 num_generated_tokens = len(self.tokenizer.encode(safe_fallback)) if self.tokenizer else len(safe_fallback.split())
                 grounding_result = {"is_grounded": True, "flagged_issues": []}
                 fallback_used = True
+                source = "grounded_fallback"
+
+        # Check for consecutive identical opening hooks in sampled generation
+        if do_sample and grounding_result["is_grounded"] and not fallback_used:
+            current_hook = extract_opening_hook(complete_draft, num_words=5)
+            if self.last_opening_hook and current_hook and current_hook == self.last_opening_hook:
+                alt_seed = (seed * 37 + 19) % 100000 + 1
+                torch.manual_seed(alt_seed)
+                with torch.inference_mode():
+                    alt_ids = self.model.generate(
+                        **inputs,
+                        max_new_tokens=effective_max_tokens,
+                        min_new_tokens=min_new_tokens,
+                        do_sample=True,
+                        temperature=temperature,
+                        top_p=top_p,
+                        repetition_penalty=repetition_penalty,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                    )
+                alt_tokens = alt_ids[0][input_len:]
+                alt_text = self.tokenizer.decode(alt_tokens, skip_special_tokens=True).strip()
+                alt_text = ensure_complete_thoughts(alt_text)
+                alt_draft = f"{lead_in.strip()} {alt_text}".strip() if lead_in else alt_text
+                alt_draft = ensure_complete_thoughts(alt_draft)
+                alt_grounding = validate_grounding(topic, personal_knowledge, alt_draft)
+                alt_hook = extract_opening_hook(alt_draft, num_words=5)
+                if alt_grounding["is_grounded"] and alt_hook != self.last_opening_hook:
+                    raw_generated_text = alt_text
+                    decoded_text = alt_text
+                    complete_draft = alt_draft
+                    num_generated_tokens = len(alt_tokens)
+                    grounding_result = alt_grounding
+
+        self.last_opening_hook = extract_opening_hook(complete_draft, num_words=5)
 
         tok_per_sec = num_generated_tokens / t_elapsed if t_elapsed > 0 else 0.0
+        word_count = len(complete_draft.split())
+        sentence_count = len(extract_sentences(complete_draft))
+        paragraph_count = len([p for p in complete_draft.split("\n\n") if p.strip()])
+
+        # Calculate exact token counts using the loaded model tokenizer
+        raw_token_count = len(self.tokenizer.encode(raw_generated_text)) if self.tokenizer else len(raw_generated_text.split())
+        final_token_count = len(self.tokenizer.encode(complete_draft)) if self.tokenizer else len(complete_draft.split())
 
         return {
             "topic": topic,
             "personal_knowledge": personal_knowledge,
             "lead_in": lead_in,
             "prompt": prompt,
+            "raw_generated_text": raw_generated_text,
             "generated_text": decoded_text,
             "complete_draft": complete_draft,
             "tokens_generated": num_generated_tokens,
+            "token_count": final_token_count,
+            "final_token_count": final_token_count,
+            "raw_token_count": raw_token_count,
+            "word_count": word_count,
+            "sentence_count": sentence_count,
+            "paragraph_count": paragraph_count,
+            "source": source,
             "elapsed_sec": round(t_elapsed, 2),
             "tokens_per_sec": round(tok_per_sec, 2),
             "peak_ram_mb": round(current_ram_mb, 1),
