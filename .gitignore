@@ -7,6 +7,7 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Build outputs
 node_modules
 .output
 stats.html
@@ -24,3 +25,37 @@ web-ext.config.ts
 *.njsproj
 *.sln
 *.sw?
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local personal migration datasets and ingestion (private user data)
+entrypoints/utils/reconciledDataset.local.ts
+entrypoints/utils/reconcileKnowledgeV2.ts
+entrypoints/utils/reconcileKnowledgeV2.test.ts
+entrypoints/utils/personalWritingIngestion.ts
+entrypoints/utils/personalWritingIngestion.test.ts
+entrypoints/utils/groundingRegression.test.ts
+entrypoints/utils/liveWorkflow.test.ts
+*.local.ts
+*.local.json
+
+# Scratch directories, personal backups, and JSON audits
+scratch/
+backups/
+*.indexeddb.leveldb
+full_16_*.json
+complete_16_*.json
+dumped_16_*.json
+
+# Training data manifests, JSONL datasets, and model weight artifacts
+training-data/
+training-output/
+*.safetensors
+*.bin
+*.pt
+*.jsonl

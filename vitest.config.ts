@@ -4,5 +4,15 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['**/*.test.ts'],
+    exclude: [
+      '**/node_modules/**',
+      '**/scratch/**',
+      '**/.output/**',
+      '**/*.local.*',
+      '**/reconcileKnowledgeV2.*',
+      '**/personalWritingIngestion.*',
+      '**/groundingRegression.*',
+      '**/liveWorkflow.*',
+    ],
   },
 });

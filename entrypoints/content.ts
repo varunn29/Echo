@@ -1,48 +1,93 @@
+import {
+  CLIENT_DEBOUNCE_MS,
+  deliverMessageWithRetry,
+  extractUserMessageText,
+  findComposerElement,
+  getElementText,
+  isSendButton,
+  resolveMessageText,
+  shouldDebounce,
+} from './utils/collectionHelper';
+
 export default defineContentScript({
   matches: ['https://chatgpt.com/*'],
 
-  main() {
-    console.log('Echo: ChatGPT content script loaded.');
+  main(ctx) {
+    console.log('Echo: ChatGPT continuous collection script active.');
 
     let lastBufferedText = '';
     let lastSentMessage = '';
     let lastSentTime = 0;
-    const CLIENT_DEBOUNCE_MS = 2000;
+    const seenUserMessageElements = new WeakSet<Element>();
 
-    function findComposerElement(): HTMLElement | null {
-      return (
-        document.getElementById('prompt-textarea') ||
-        document.querySelector<HTMLElement>(
-          'form[data-chatgpt-composer] [contenteditable="true"]'
-        ) ||
-        document.querySelector<HTMLElement>('form [contenteditable="true"]') ||
-        document.querySelector<HTMLElement>('form textarea') ||
-        document.querySelector<HTMLElement>(
-          '[contenteditable="true"][data-placeholder]'
-        ) ||
-        document.querySelector<HTMLElement>('div[contenteditable="true"]')
+    // Mark pre-existing conversation messages so they are never collected on initial load or navigation
+    function markExistingMessages() {
+      const existingUserTurns = document.querySelectorAll('[data-message-author-role="user"]');
+      Array.from(existingUserTurns).forEach(function (turn) {
+        seenUserMessageElements.add(turn);
+      });
+    }
+
+    markExistingMessages();
+
+    async function handleSendMessage(explicitText?: string) {
+      const composer = findComposerElement();
+      const domText = explicitText !== undefined && explicitText.trim()
+        ? explicitText.trim()
+        : getElementText(composer);
+
+      const messageText = resolveMessageText(domText, lastBufferedText);
+      if (!messageText) {
+        return;
+      }
+
+      const now = Date.now();
+      if (shouldDebounce(messageText, lastSentMessage, now, lastSentTime, CLIENT_DEBOUNCE_MS)) {
+        return;
+      }
+
+      // Record dispatch immediately to prevent concurrent event loops
+      lastSentMessage = messageText;
+      lastSentTime = now;
+      lastBufferedText = '';
+
+      const response = await deliverMessageWithRetry(messageText, (msg) =>
+        browser.runtime.sendMessage(msg)
       );
-    }
 
-    function getElementText(element: HTMLElement | null): string {
-      if (!element) {
-        return '';
+      if (!response) {
+        // Reset on total delivery failure so future attempts/manual retries are not locked out
+        lastSentMessage = '';
+        return;
       }
 
-      if (
-        element instanceof HTMLTextAreaElement ||
-        element instanceof HTMLInputElement
-      ) {
-        return element.value.trim();
+      if (response.status === 'saved') {
+        console.log('Echo: Message persisted successfully with ID:', response.id);
+      } else if (response.status === 'duplicate') {
+        console.log('Echo: Duplicate message acknowledged and safely ignored by database.');
+      } else if (!response.success) {
+        console.warn('Echo: Background could not save message:', response.error);
       }
-
-      return (element.innerText || element.textContent || '').trim();
     }
 
-    // Continually buffer text as the user types/pastes so we never lose it
-    // if React clears the DOM before submit/click listeners execute.
+    // 1. Live Input Buffering
+    // Continually buffers user typing so input is never lost if React resets the DOM before click completes
     document.addEventListener(
       'input',
+      function () {
+        const composer = findComposerElement();
+        const text = getElementText(composer);
+        if (text) {
+          lastBufferedText = text;
+        } else {
+          lastBufferedText = '';
+        }
+      },
+      true
+    );
+
+    document.addEventListener(
+      'compositionend',
       function () {
         const composer = findComposerElement();
         const text = getElementText(composer);
@@ -53,152 +98,130 @@ export default defineContentScript({
       true
     );
 
-    function isSendButton(target: Element): boolean {
-      return Boolean(
-        target.closest(
-          'button[data-testid="send-button"], button[aria-label*="Send" i], button[data-testid="composer-send-button"], form button[type="submit"]'
-        )
-      );
-    }
-
-    async function captureAndSendMessage() {
-      // 1. Read directly from the DOM composer first.
-      const composer = findComposerElement();
-      let messageText = getElementText(composer);
-
-      // 2. Fall back to buffered text if the DOM was already wiped by ChatGPT.
-      if (!messageText && lastBufferedText) {
-        messageText = lastBufferedText;
-      }
-
-      if (!messageText) {
-        return;
-      }
-
-      const now = Date.now();
-
-      // Prevent accidental duplicate sends across multiple listeners for the same user action.
-      if (
-        messageText === lastSentMessage &&
-        now - lastSentTime < CLIENT_DEBOUNCE_MS
-      ) {
-        return;
-      }
-
-      lastSentMessage = messageText;
-      lastSentTime = now;
-      lastBufferedText = '';
-
-      try {
-        const response = await browser.runtime.sendMessage({
-          type: 'NEW_USER_MESSAGE',
-          text: messageText,
-        });
-
-        if (!response) {
-          console.warn(
-            'Echo: No acknowledgment received from background service worker.'
-          );
-          return;
+    // 2. Button Activation (pointerdown + mousedown)
+    // Critical: React can unmount the send button or replace it with the stop button during mousedown.
+    // Capturing on pointerdown/mousedown guarantees the message is read and dispatched BEFORE React tears down the DOM.
+    function onSendButtonInteraction(event: Event) {
+      const target = event.target as Node | null;
+      if (isSendButton(target)) {
+        const composer = findComposerElement();
+        const text = getElementText(composer);
+        if (text) {
+          lastBufferedText = text;
         }
-
-        if (!response.success) {
-          console.error(
-            'Echo: Background failed to persist message:',
-            response.error
-          );
-          return;
-        }
-
-        if (response.status === 'duplicate') {
-          console.log(
-            'Echo: Duplicate message acknowledged and safely ignored by database.'
-          );
-          return;
-        }
-
-        if (response.status === 'saved') {
-          console.log(
-            'Echo: Message persisted to database with ID:',
-            response.id
-          );
-        }
-      } catch (error) {
-        console.error(
-          'Echo: Failed to deliver message to background service worker:',
-          error
-        );
+        handleSendMessage(text);
       }
     }
 
-    // Buffer on pointerdown before React starts unmounting/clearing the input on click.
-    document.addEventListener(
-      'pointerdown',
-      function (event) {
-        if (event.target instanceof Element && isSendButton(event.target)) {
-          const composer = findComposerElement();
-          const text = getElementText(composer);
-          if (text) {
-            lastBufferedText = text;
-          }
-        }
-      },
-      true
-    );
+    document.addEventListener('pointerdown', onSendButtonInteraction, true);
+    document.addEventListener('mousedown', onSendButtonInteraction, true);
 
-    // Capture when Send button is clicked.
+    // 3. Button Click (Native click fallback for keyboard-triggered button activations)
     document.addEventListener(
       'click',
       function (event) {
-        if (event.target instanceof Element && isSendButton(event.target)) {
-          captureAndSendMessage();
+        const target = event.target as Node | null;
+        if (isSendButton(target)) {
+          handleSendMessage();
         }
       },
       true
     );
 
-    // Capture when Enter is pressed without Shift or IME composition.
+    // 4. Keyboard Enter Key
     document.addEventListener(
       'keydown',
       function (event) {
-        if (
-          event.key === 'Enter' &&
-          !event.shiftKey &&
-          !event.isComposing
-        ) {
-          const target = event.target;
+        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+          const target = event.target as Node | null;
+          const element = target instanceof Element ? target : target?.parentElement;
 
           if (
-            target instanceof Element &&
-            (target.id === 'prompt-textarea' ||
-              target.closest('#prompt-textarea') ||
-              target.closest('[contenteditable="true"]') ||
-              target instanceof HTMLTextAreaElement)
+            element &&
+            (element.id === 'prompt-textarea' ||
+              element.closest('#prompt-textarea') ||
+              element.closest('div[contenteditable="true"]') ||
+              element.closest('form[data-chatgpt-composer]') ||
+              element instanceof HTMLTextAreaElement)
           ) {
-            captureAndSendMessage();
+            const composer = findComposerElement();
+            const text = getElementText(composer);
+            handleSendMessage(text);
           }
         }
       },
       true
     );
 
-    // Capture when the ChatGPT form is submitted.
+    // 5. Form Submission
     document.addEventListener(
       'submit',
       function (event) {
-        const target = event.target;
-
-        if (
-          target instanceof HTMLFormElement &&
-          (target.matches('form[data-chatgpt-composer]') ||
-            target.querySelector('#prompt-textarea') ||
-            target.querySelector('[contenteditable="true"]') ||
-            target.querySelector('textarea'))
-        ) {
-          captureAndSendMessage();
+        const target = event.target as Node | null;
+        if (target instanceof HTMLFormElement) {
+          handleSendMessage();
         }
       },
       true
     );
+
+    // 6. Chat Feed Mutation Observer (Safety Net)
+    // Catches messages sent via suggestion prompts, voice dictation, or when event listeners were bypassed.
+    // Crucially ONLY checks elements with data-message-author-role="user", completely ignoring assistant turns.
+    let mutationDebounceTimer: number | null = null;
+
+    function processAddedChatTurns() {
+      const userTurns = document.querySelectorAll<HTMLElement>('[data-message-author-role="user"]');
+      Array.from(userTurns).forEach(function (turn) {
+        if (!seenUserMessageElements.has(turn)) {
+          seenUserMessageElements.add(turn);
+          const messageText = extractUserMessageText(turn);
+          if (messageText) {
+            handleSendMessage(messageText);
+          }
+        }
+      });
+    }
+
+    const chatObserver = new MutationObserver(function () {
+      if (mutationDebounceTimer !== null) {
+        clearTimeout(mutationDebounceTimer);
+      }
+      mutationDebounceTimer = window.setTimeout(function () {
+        mutationDebounceTimer = null;
+        processAddedChatTurns();
+      }, 100);
+    });
+
+    chatObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+
+    // 7. SPA Navigation and History Transitions
+    function handleNavigation() {
+      lastBufferedText = '';
+      // Allow new route DOM to stabilize, then mark historical messages
+      window.setTimeout(function () {
+        markExistingMessages();
+      }, 300);
+    }
+
+    window.addEventListener('popstate', handleNavigation);
+    window.addEventListener('hashchange', handleNavigation);
+
+    if (ctx && typeof ctx.addEventListener === 'function') {
+      try {
+        ctx.addEventListener(window, 'wxt:locationchange' as any, handleNavigation);
+        ctx.onInvalidated(function () {
+          chatObserver.disconnect();
+          if (mutationDebounceTimer !== null) {
+            clearTimeout(mutationDebounceTimer);
+          }
+        });
+      } catch (err) {
+        console.debug('Echo: WXT context listener registered with fallback:', err);
+      }
+    }
   },
 });
