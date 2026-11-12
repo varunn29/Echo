@@ -82,6 +82,7 @@ function WritingData() {
         isRunning: false,
         isModelReady: false,
         modelName: DEFAULT_OLLAMA_MODEL,
+        availability: 'offline',
         error: 'Unable to connect to Ollama on http://localhost:11434.',
       });
     } finally {
@@ -155,6 +156,8 @@ function WritingData() {
             setActionFeedback('Extraction is already in progress.');
           } else if (res?.status === 'service_offline') {
             setActionError('Ollama is offline. Start Ollama to begin extraction.');
+          } else if (res?.status === 'service_unknown') {
+            setActionError(res.error || 'Ollama is responding slowly. Please check Ollama and try again.');
           } else if (res?.status === 'service_blocked') {
             setActionError(`Extraction blocked: ${res.error || 'Model not installed or origin rejected.'}`);
           } else if (res?.status === 'empty') {
@@ -401,6 +404,11 @@ function WritingData() {
                       <CheckCircle2 size={14} />
                       Ollama Connected ({DEFAULT_OLLAMA_MODEL})
                     </span>
+                  ) : ollamaStatus?.availability === 'unknown' ? (
+                    <span className="flex items-center gap-1.5 font-medium text-amber-700">
+                      <Clock size={14} />
+                      {ollamaStatus?.error || 'Ollama is responding slowly; checking again.'}
+                    </span>
                   ) : (
                     <span className="flex items-center gap-1.5 font-medium text-amber-700">
                       <AlertCircle size={14} />
@@ -514,6 +522,14 @@ function WritingData() {
                     <AlertCircle size={14} className="text-amber-600" />
                     <span>
                       Ollama is currently offline. Background extraction is paused and will automatically resume once Ollama is online.
+                    </span>
+                  </div>
+                ) : coordinatorStatus.serviceStatus === 'unknown' ? (
+                  <div className="flex items-center gap-2 text-xs text-amber-800">
+                    <Clock size={14} className="text-amber-600" />
+                    <span>
+                      {coordinatorStatus.serviceError ||
+                        'Ollama is responding slowly. Background extraction will automatically resume once Ollama is responsive.'}
                     </span>
                   </div>
                 ) : coordinatorStatus.serviceStatus === 'blocked_configuration' ? (

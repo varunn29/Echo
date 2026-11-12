@@ -16,6 +16,7 @@ import {
   enqueueKnowledgeMessage,
   getCoordinatorState,
   getKnowledgeCoordinatorStatus,
+  isCooldownEligible,
   KNOWLEDGE_RETRY_ALARM_NAME,
   mutateCoordinatorState,
   processKnowledgeQueue,
@@ -1094,6 +1095,514 @@ describe('Knowledge Coordinator Suite', function () {
       expect(state.registry[401]?.status).toBe('pending');
       expect(state.registry[402]?.status).toBe('pending');
       expect(state.pendingQueue).toHaveLength(2);
+    });
+  });
+
+  describe('11. Phase 3 Timeout, Cooldown & Service Availability Hardening', function () {
+    it('1. should increment message attempt count when inference times out', async function () {
+      const dbName = createUniqueDbName('TimeoutAttemptIncrement');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I built an e-commerce platform using Next.js and Stripe.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      const msg = (await testDb.writingMessages.get(msgId))!;
+      await enqueueKnowledgeMessage(msg, { storage: testStorage });
+
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'qwen3.5:2b',
+        availability: 'online',
+      });
+
+      vi.spyOn(knowledgeExtractor, 'extractKnowledgeFromMessage').mockRejectedValue(
+        new ollamaClient.OllamaError('Ollama request timed out after 120s.', 'timeout')
+      );
+
+      const sleepFn = vi.fn().mockResolvedValue(undefined);
+      await processKnowledgeQueue({
+        storage: testStorage,
+        targetDb: testDb,
+        sleepFn,
+        cooldownMs: 1500,
+      });
+
+      const state = await getCoordinatorState(testStorage);
+      expect(state.registry[msgId]?.status).toBe('failed_temporary');
+      expect(state.registry[msgId]?.attempts).toBe(1);
+      expect(state.registry[msgId]?.lastError).toContain('timed out after 120s');
+    });
+
+    it('2. should not directly mark global serviceStatus offline when inference times out', async function () {
+      const dbName = createUniqueDbName('TimeoutNotOffline');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I created a personal finance tracker using Vue and IndexedDB.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      const msg = (await testDb.writingMessages.get(msgId))!;
+      await enqueueKnowledgeMessage(msg, { storage: testStorage });
+
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'qwen3.5:2b',
+        availability: 'online',
+      });
+
+      vi.spyOn(knowledgeExtractor, 'extractKnowledgeFromMessage').mockRejectedValue(
+        new ollamaClient.OllamaError('Ollama request timed out after 120s.', 'timeout')
+      );
+
+      const sleepFn = vi.fn().mockResolvedValue(undefined);
+      await processKnowledgeQueue({
+        storage: testStorage,
+        targetDb: testDb,
+        sleepFn,
+        cooldownMs: 1500,
+      });
+
+      const state = await getCoordinatorState(testStorage);
+      expect(state.serviceStatus).toBe('online');
+      expect(state.serviceStatus).not.toBe('offline');
+    });
+
+    it('3. should classify HTTP 500 as message-level failure and not mark service offline', async function () {
+      const dbName = createUniqueDbName('Http500Test');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I designed a distributed pub/sub system in Go.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      const msg = (await testDb.writingMessages.get(msgId))!;
+      await enqueueKnowledgeMessage(msg, { storage: testStorage });
+
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'qwen3.5:2b',
+        availability: 'online',
+      });
+
+      const http500Err = new ollamaClient.OllamaError(
+        'Ollama returned HTTP error 500: Internal Server Error',
+        'http_error',
+        500
+      );
+      vi.spyOn(knowledgeExtractor, 'extractKnowledgeFromMessage').mockRejectedValue(http500Err);
+
+      expect(classifyExtractionError(http500Err).category).toBe('message_failure');
+
+      const sleepFn = vi.fn().mockResolvedValue(undefined);
+      await processKnowledgeQueue({
+        storage: testStorage,
+        targetDb: testDb,
+        sleepFn,
+        cooldownMs: 1500,
+      });
+
+      const state = await getCoordinatorState(testStorage);
+      expect(state.serviceStatus).toBe('online');
+      expect(state.registry[msgId]?.status).toBe('failed_temporary');
+      expect(state.registry[msgId]?.attempts).toBe(1);
+    });
+
+    it('4. should execute cooldown before next pre-flight health check after timeout or HTTP 500', async function () {
+      const dbName = createUniqueDbName('CooldownVerification');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId1 = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I designed a distributed cache engine using Redis and Go.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+      const msgId2 = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I developed a real-time messaging pipeline using Kafka and Node.js.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      await enqueueKnowledgeMessage((await testDb.writingMessages.get(msgId1))!, { storage: testStorage });
+      await enqueueKnowledgeMessage((await testDb.writingMessages.get(msgId2))!, { storage: testStorage });
+
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'qwen3.5:2b',
+        availability: 'online',
+      });
+
+      // First call times out, second succeeds
+      vi.spyOn(knowledgeExtractor, 'extractKnowledgeFromMessage')
+        .mockRejectedValueOnce(new ollamaClient.OllamaError('Ollama request timed out after 120s.', 'timeout'))
+        .mockResolvedValueOnce({
+          messageId: msgId2,
+          outcome: 'empty',
+          extractedCount: 0,
+          duplicateCount: 0,
+        });
+
+      const sleepFn = vi.fn().mockResolvedValue(undefined);
+
+      await processKnowledgeQueue({
+        storage: testStorage,
+        targetDb: testDb,
+        sleepFn,
+        cooldownMs: 1500,
+      });
+
+      // Cooldown must have been called with 1500ms after the timeout
+      expect(sleepFn).toHaveBeenCalledWith(1500);
+
+      // Verify cooldown eligibility helper
+      expect(isCooldownEligible(new ollamaClient.OllamaError('timeout', 'timeout'))).toBe(true);
+      expect(isCooldownEligible(new ollamaClient.OllamaError('500', 'http_error', 500))).toBe(true);
+      expect(isCooldownEligible(new Error('Random syntax error'))).toBe(false);
+    });
+
+    it('5. should not persist confirmed offline status when health-check times out (availability unknown)', async function () {
+      const dbName = createUniqueDbName('HealthCheckTimeoutUnknown');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I built microservices using Kafka and Docker.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      await enqueueKnowledgeMessage((await testDb.writingMessages.get(msgId))!, { storage: testStorage });
+
+      // Health check times out
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: false,
+        isModelReady: false,
+        modelName: 'qwen3.5:2b',
+        availability: 'unknown',
+        error: 'Ollama health check timed out. Ollama may be busy or responding slowly.',
+      });
+
+      const res = await processKnowledgeQueue({ storage: testStorage, targetDb: testDb });
+      expect(res.status).toBe('service_unknown');
+
+      const state = await getCoordinatorState(testStorage);
+      expect(state.serviceStatus).toBe('unknown');
+      expect(state.serviceStatus).not.toBe('offline');
+      expect(state.serviceError).toContain('Ollama health check timed out');
+      expect(state.pendingQueue).toHaveLength(1);
+      // Attempts must not be incremented on service unknown
+      expect(state.pendingQueue[0]?.attempts).toBe(0);
+
+      // Alarm must be scheduled to retry when service becomes ready
+      expect(mockAlarms.create).toHaveBeenCalledWith(
+        KNOWLEDGE_RETRY_ALARM_NAME,
+        expect.objectContaining({ delayInMinutes: 1, periodInMinutes: 1 })
+      );
+    });
+
+    it('6. should pause queue and set confirmed offline on genuine network failure', async function () {
+      const dbName = createUniqueDbName('GenuineNetworkFailure');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I designed and deployed multi-container platforms using Docker and Kubernetes.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      await enqueueKnowledgeMessage((await testDb.writingMessages.get(msgId))!, { storage: testStorage });
+
+      // Confirmed offline (ECONNREFUSED)
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: false,
+        isModelReady: false,
+        modelName: 'qwen3.5:2b',
+        availability: 'offline',
+        error: 'Ollama is offline or unreachable at http://localhost:11434. Please start Ollama.',
+      });
+
+      const res = await processKnowledgeQueue({ storage: testStorage, targetDb: testDb });
+      expect(res.status).toBe('service_offline');
+
+      const state = await getCoordinatorState(testStorage);
+      expect(state.serviceStatus).toBe('offline');
+      expect(state.pendingQueue).toHaveLength(1);
+      expect(state.pendingQueue[0]?.attempts).toBe(0);
+
+      expect(mockAlarms.create).toHaveBeenCalledWith(
+        KNOWLEDGE_RETRY_ALARM_NAME,
+        expect.objectContaining({ delayInMinutes: 1, periodInMinutes: 1 })
+      );
+    });
+
+    it('7. should process pending messages when service recovers after transient unknown failure', async function () {
+      const dbName = createUniqueDbName('RecoveryAfterUnknown');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I built mobile apps in Flutter and Dart.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      await enqueueKnowledgeMessage((await testDb.writingMessages.get(msgId))!, { storage: testStorage });
+
+      // First run: health check times out
+      const checkSpy = vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: false,
+        isModelReady: false,
+        modelName: 'qwen3.5:2b',
+        availability: 'unknown',
+        error: 'Ollama health check timed out.',
+      });
+
+      const res1 = await processKnowledgeQueue({ storage: testStorage, targetDb: testDb });
+      expect(res1.status).toBe('service_unknown');
+      let state = await getCoordinatorState(testStorage);
+      expect(state.serviceStatus).toBe('unknown');
+      expect(state.pendingQueue).toHaveLength(1);
+
+      // Second run: service recovers
+      checkSpy.mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'qwen3.5:2b',
+        availability: 'online',
+      });
+      vi.spyOn(knowledgeExtractor, 'extractKnowledgeFromMessage').mockResolvedValue({
+        messageId: msgId,
+        outcome: 'extracted',
+        extractedCount: 1,
+        duplicateCount: 0,
+      });
+
+      const res2 = await processKnowledgeQueue({ storage: testStorage, targetDb: testDb });
+      expect(res2.status).toBe('completed');
+      expect(res2.processedCount).toBe(1);
+
+      state = await getCoordinatorState(testStorage);
+      expect(state.serviceStatus).toBe('online');
+      expect(state.registry[msgId]?.status).toBe('extracted');
+      expect(state.pendingQueue).toHaveLength(0);
+    });
+
+    it('8. should transition to failed_permanent after MAX_EXTRACTION_ATTEMPTS timeouts', async function () {
+      const dbName = createUniqueDbName('MaxAttemptsTest');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I designed secure backend APIs with OAuth2.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      await enqueueKnowledgeMessage((await testDb.writingMessages.get(msgId))!, { storage: testStorage });
+
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'qwen3.5:2b',
+        availability: 'online',
+      });
+      vi.spyOn(knowledgeExtractor, 'extractKnowledgeFromMessage').mockRejectedValue(
+        new ollamaClient.OllamaError('Ollama request timed out after 120s.', 'timeout')
+      );
+
+      const sleepFn = vi.fn().mockResolvedValue(undefined);
+
+      // Attempt 1
+      await processKnowledgeQueue({ storage: testStorage, targetDb: testDb, sleepFn, cooldownMs: 0 });
+      let state = await getCoordinatorState(testStorage);
+      expect(state.registry[msgId]?.status).toBe('failed_temporary');
+      expect(state.registry[msgId]?.attempts).toBe(1);
+
+      // Attempt 2
+      await processKnowledgeQueue({ storage: testStorage, targetDb: testDb, sleepFn, cooldownMs: 0 });
+      state = await getCoordinatorState(testStorage);
+      expect(state.registry[msgId]?.status).toBe('failed_temporary');
+      expect(state.registry[msgId]?.attempts).toBe(2);
+
+      // Attempt 3
+      await processKnowledgeQueue({ storage: testStorage, targetDb: testDb, sleepFn, cooldownMs: 0 });
+      state = await getCoordinatorState(testStorage);
+      expect(state.registry[msgId]?.status).toBe('failed_permanent');
+      expect(state.registry[msgId]?.attempts).toBe(3);
+      expect(state.pendingQueue).toHaveLength(0);
+    });
+
+    it('9. should not rapidly retry the same timed-out message in the same processing run', async function () {
+      const dbName = createUniqueDbName('NoRapidRepeatedRetries');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I built an internal devops CLI tool in Rust.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      await enqueueKnowledgeMessage((await testDb.writingMessages.get(msgId))!, { storage: testStorage });
+
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'qwen3.5:2b',
+        availability: 'online',
+      });
+
+      const extractSpy = vi
+        .spyOn(knowledgeExtractor, 'extractKnowledgeFromMessage')
+        .mockRejectedValue(
+          new ollamaClient.OllamaError('Ollama request timed out after 120s.', 'timeout')
+        );
+
+      const sleepFn = vi.fn().mockResolvedValue(undefined);
+      const res = await processKnowledgeQueue({
+        storage: testStorage,
+        targetDb: testDb,
+        sleepFn,
+        cooldownMs: 0,
+      });
+
+      // In this run, extractKnowledgeFromMessage was called exactly ONCE for this message
+      expect(extractSpy).toHaveBeenCalledTimes(1);
+      expect(res.processedCount).toBe(0);
+
+      const state = await getCoordinatorState(testStorage);
+      // It is marked failed_temporary with attempt: 1 and waiting in queue for the next run
+      expect(state.registry[msgId]?.attempts).toBe(1);
+      expect(state.registry[msgId]?.status).toBe('failed_temporary');
+      expect(state.pendingQueue).toHaveLength(1);
+    });
+
+    it('10. should maintain extraction concurrency of exactly one', async function () {
+      const dbName = createUniqueDbName('ConcurrencyCheck');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I developed automated testing harnesses in TypeScript.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      await enqueueKnowledgeMessage((await testDb.writingMessages.get(msgId))!, { storage: testStorage });
+
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'qwen3.5:2b',
+        availability: 'online',
+      });
+
+      let releaseExtraction!: () => void;
+      const delayedExtraction = new Promise<never>((resolve) => {
+        releaseExtraction = () =>
+          resolve({
+            messageId: msgId,
+            outcome: 'empty',
+            extractedCount: 0,
+            duplicateCount: 0,
+          } as never);
+      });
+
+      vi.spyOn(knowledgeExtractor, 'extractKnowledgeFromMessage').mockReturnValue(delayedExtraction as never);
+
+      // Start run 1
+      const run1Promise = processKnowledgeQueue({ storage: testStorage, targetDb: testDb });
+
+      // Attempt concurrent run 2
+      const run2 = await processKnowledgeQueue({ storage: testStorage, targetDb: testDb });
+      expect(run2.status).toBe('already_running');
+      expect(run2.processedCount).toBe(0);
+
+      releaseExtraction();
+      const run1 = await run1Promise;
+      expect(run1.status).toBe('completed');
+      expect(run1.processedCount).toBe(1);
     });
   });
 });

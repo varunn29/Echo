@@ -104,6 +104,8 @@ export interface CoordinatorOptions {
   targetDb?: EchoDatabase;
   storage?: StorageLike;
   ollamaOptions?: OllamaClientOptions;
+  cooldownMs?: number;
+  sleepFn?: (ms: number) => Promise<void>;
 }
 
 export interface EnqueueResult {
@@ -121,7 +123,13 @@ export interface SyncUntrackedResult {
 }
 
 export interface ProcessQueueResult {
-  status: 'completed' | 'already_running' | 'service_offline' | 'service_blocked' | 'empty';
+  status:
+    | 'completed'
+    | 'already_running'
+    | 'service_offline'
+    | 'service_blocked'
+    | 'service_unknown'
+    | 'empty';
   processedCount: number;
   error?: string;
 }
@@ -295,9 +303,24 @@ export async function clearKnowledgeRetryAlarm(): Promise<void> {
 }
 
 export type ErrorClassification = {
-  category: 'service_offline' | 'service_blocked' | 'message_failure';
+  category: 'service_offline' | 'service_blocked' | 'service_unknown' | 'message_failure';
   message: string;
 };
+
+/**
+ * Determines whether an extraction failure warrants a brief cooldown period
+ * (e.g. to allow Ollama to cleanly terminate a canceled runner subprocess before another health check).
+ */
+export function isCooldownEligible(err: unknown): boolean {
+  if (err instanceof OllamaError) {
+    return err.kind === 'timeout' || (err.kind === 'http_error' && err.statusCode === 500);
+  }
+  if (err instanceof Error) {
+    const msg = err.message.toLowerCase();
+    return msg.includes('timed out') || msg.includes('timeout') || msg.includes('500');
+  }
+  return false;
+}
 
 /**
  * Sanitizes error messages to prevent exposing personal message text or token payloads.
@@ -317,7 +340,23 @@ export function sanitizeErrorMessage(err: unknown): string {
  */
 export function classifyExtractionError(err: unknown, status?: OllamaStatus): ErrorClassification {
   if (status) {
+    if (status.availability === 'unknown') {
+      return {
+        category: 'service_unknown',
+        message: sanitizeErrorMessage(status.error || 'Ollama is responding slowly; health check timed out.'),
+      };
+    }
     if (!status.isRunning) {
+      if (
+        status.error &&
+        (status.error.toLowerCase().includes('timed out') ||
+          status.error.toLowerCase().includes('responding slowly'))
+      ) {
+        return {
+          category: 'service_unknown',
+          message: sanitizeErrorMessage(status.error),
+        };
+      }
       return {
         category: 'service_offline',
         message: sanitizeErrorMessage(status.error || 'Ollama is offline.'),
@@ -344,11 +383,16 @@ export function classifyExtractionError(err: unknown, status?: OllamaStatus): Er
   if (err instanceof Error) {
     const lower = err.message.toLowerCase();
     if (
+      lower.includes('health check timed out') ||
+      lower.includes('responding slowly')
+    ) {
+      return { category: 'service_unknown', message: sanitizeErrorMessage(err.message) };
+    }
+    if (
       lower.includes('offline') ||
       lower.includes('unreachable') ||
       lower.includes('econnrefused') ||
-      lower.includes('fetch failed') ||
-      lower.includes('health check timed out')
+      lower.includes('fetch failed')
     ) {
       return { category: 'service_offline', message: sanitizeErrorMessage(err.message) };
     }
@@ -580,6 +624,8 @@ export async function processKnowledgeQueue(
   const ollamaOptions = options.ollamaOptions || {};
   const baseUrl = ollamaOptions.baseUrl || DEFAULT_OLLAMA_BASE_URL;
   const model = ollamaOptions.model || DEFAULT_OLLAMA_MODEL;
+  const cooldownMs = options.cooldownMs ?? 1500;
+  const sleepFn = options.sleepFn ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
   let processedCount = 0;
   const seenInThisRun = new Set<number>();
@@ -591,15 +637,39 @@ export async function processKnowledgeQueue(
       try {
         serviceCheck = await checkOllamaStatus(model, baseUrl);
       } catch (err: unknown) {
+        const isAbort = err instanceof Error && err.name === 'AbortError';
         serviceCheck = {
           isRunning: false,
           isModelReady: false,
           modelName: model,
+          availability: isAbort ? 'unknown' : 'offline',
           error: sanitizeErrorMessage(err),
         };
       }
 
       if (!serviceCheck.isRunning) {
+        const isUnknown =
+          serviceCheck.availability === 'unknown' ||
+          Boolean(
+            serviceCheck.error &&
+              (serviceCheck.error.toLowerCase().includes('timed out') ||
+                serviceCheck.error.toLowerCase().includes('responding slowly'))
+          );
+
+        if (isUnknown) {
+          await mutateCoordinatorState((state) => {
+            state.serviceStatus = 'unknown';
+            state.serviceError = serviceCheck.error || 'Ollama is responding slowly.';
+            state.lastCheckedAt = new Date().toISOString();
+          }, storage);
+
+          const currentQueue = (await getCoordinatorState(storage)).pendingQueue;
+          if (currentQueue.length > 0) {
+            await scheduleKnowledgeRetryAlarm();
+          }
+          return { status: 'service_unknown', processedCount, error: serviceCheck.error };
+        }
+
         await mutateCoordinatorState((state) => {
           state.serviceStatus = 'offline';
           state.serviceError = serviceCheck.error || 'Ollama is offline.';
@@ -733,6 +803,31 @@ export async function processKnowledgeQueue(
       } catch (extractErr: unknown) {
         const classification = classifyExtractionError(extractErr);
 
+        if (classification.category === 'service_unknown') {
+          // Transient health check timeout / slow response: preserve attempts, pause queue, schedule alarm
+          await mutateCoordinatorState((state) => {
+            state.inFlight = null;
+            state.pendingQueue.unshift({
+              messageId,
+              enqueuedAt: item.enqueuedAt,
+              attempts: item.attempts, // preserved without increment
+            });
+            const reg = state.registry[messageId];
+            if (reg) {
+              reg.status = 'pending';
+              reg.attempts = item.attempts;
+              reg.lastError = classification.message;
+              reg.updatedAt = new Date().toISOString();
+            }
+            state.serviceStatus = 'unknown';
+            state.serviceError = classification.message;
+            state.lastCheckedAt = new Date().toISOString();
+          }, storage);
+
+          await scheduleKnowledgeRetryAlarm();
+          return { status: 'service_unknown', processedCount, error: classification.message };
+        }
+
         if (classification.category === 'service_offline') {
           // Temporary service outage: do NOT increment attempt count, restore message to pending
           await mutateCoordinatorState((state) => {
@@ -812,6 +907,11 @@ export async function processKnowledgeQueue(
             }
           }
         }, storage);
+
+        // Cooldown after an inference timeout or HTTP 500 before continuing
+        if (isCooldownEligible(extractErr)) {
+          await sleepFn(cooldownMs);
+        }
       }
     }
   } finally {

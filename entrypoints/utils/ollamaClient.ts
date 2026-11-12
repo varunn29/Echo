@@ -16,10 +16,13 @@ export interface OllamaChatResponse {
   done?: boolean;
 }
 
+export type OllamaAvailability = 'online' | 'offline' | 'unknown' | 'blocked';
+
 export interface OllamaStatus {
   isRunning: boolean;
   isModelReady: boolean;
   modelName: string;
+  availability?: OllamaAvailability;
   error?: string;
 }
 
@@ -52,7 +55,8 @@ export interface OllamaClientOptions {
 
 export const DEFAULT_OLLAMA_BASE_URL = 'http://localhost:11434';
 export const DEFAULT_OLLAMA_MODEL = 'qwen3.5:2b';
-export const DEFAULT_TIMEOUT_MS = 60000; // 60s timeout for CPU inference
+export const DEFAULT_TIMEOUT_MS = 120000; // 120s timeout for CPU inference
+export const DEFAULT_HEALTH_CHECK_TIMEOUT_MS = 10000; // 10s timeout for health checks
 
 export const KNOWLEDGE_EXTRACTION_SYSTEM_PROMPT = `You are a personal knowledge extraction engine for a local-first writing assistant.
 Your task is to extract verifiable personal facts explicitly stated by the user about themselves from their message.
@@ -172,10 +176,11 @@ export async function isModelAvailable(
  */
 export async function checkOllamaStatus(
   modelName: string = DEFAULT_OLLAMA_MODEL,
-  baseUrl: string = DEFAULT_OLLAMA_BASE_URL
+  baseUrl: string = DEFAULT_OLLAMA_BASE_URL,
+  timeoutMs: number = DEFAULT_HEALTH_CHECK_TIMEOUT_MS
 ): Promise<OllamaStatus> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 4000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const res = await fetch(`${baseUrl}/api/tags`, {
@@ -188,6 +193,7 @@ export async function checkOllamaStatus(
         isRunning: true,
         isModelReady: false,
         modelName,
+        availability: 'blocked',
         error:
           'Ollama rejected the extension origin (403 Forbidden). Set OLLAMA_ORIGINS to allow this extension (e.g. chrome-extension://<id>) and restart Ollama.',
       };
@@ -198,6 +204,7 @@ export async function checkOllamaStatus(
         isRunning: false,
         isModelReady: false,
         modelName,
+        availability: 'offline',
         error: `Ollama returned HTTP status ${res.status}.`,
       };
     }
@@ -216,20 +223,22 @@ export async function checkOllamaStatus(
       isRunning: true,
       isModelReady,
       modelName,
+      availability: isModelReady ? 'online' : 'blocked',
       error: isModelReady
         ? undefined
         : `Model "${modelName}" is not installed in Ollama. Run: ollama pull ${modelName}`,
     };
   } catch (err: unknown) {
-    const message =
-      err instanceof Error && err.name === 'AbortError'
-        ? 'Ollama health check timed out.'
-        : 'Ollama is offline. Start Ollama to enable personal knowledge extraction.';
+    const isAbort = err instanceof Error && err.name === 'AbortError';
+    const message = isAbort
+      ? 'Ollama health check timed out. Ollama may be busy or responding slowly.'
+      : 'Ollama is offline or unreachable at http://localhost:11434. Please start Ollama.';
 
     return {
       isRunning: false,
       isModelReady: false,
       modelName,
+      availability: isAbort ? 'unknown' : 'offline',
       error: message,
     };
   } finally {
