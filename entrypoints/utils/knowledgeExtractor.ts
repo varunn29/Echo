@@ -649,17 +649,37 @@ export function parseExtractionResponse(
   return validDrafts;
 }
 
+export interface PersistGroundedKnowledgeResult {
+  knowledgeId: number;
+  isNewKnowledge: boolean;
+  abortedDueToDeletion?: boolean;
+}
+
+export type ExtractionOutcome = 'extracted' | 'empty' | 'aborted_deleted';
+
+export interface ExtractSingleMessageResult {
+  messageId: number;
+  outcome: ExtractionOutcome;
+  extractedCount: number;
+  duplicateCount: number;
+}
+
+export interface ExtractKnowledgeOptions {
+  targetDb?: EchoDatabase;
+  ollamaOptions?: OllamaClientOptions;
+}
+
 /**
  * Persists an extracted knowledge item and its evidence into the database atomically.
  * Handles deduplication: if an active item with identical (category, subject, predicate) exists,
  * it avoids creating a duplicate and links the new evidence to the existing knowledge item.
- * Guarantees zero orphaned knowledge items.
+ * Guarantees zero orphaned knowledge items and aborts cleanly if source message was deleted.
  */
 export async function persistGroundedKnowledge(
   draft: ValidatedKnowledgeDraft,
   messageId: number,
   targetDb: EchoDatabase = db
-): Promise<{ knowledgeId: number; isNewKnowledge: boolean }> {
+): Promise<PersistGroundedKnowledgeResult> {
   if (!targetDb.isOpen()) {
     await targetDb.open();
   }
@@ -670,8 +690,18 @@ export async function persistGroundedKnowledge(
 
   return targetDb.transaction(
     'rw',
-    [targetDb.personalKnowledge, targetDb.knowledgeEvidence],
+    [targetDb.writingMessages, targetDb.personalKnowledge, targetDb.knowledgeEvidence],
     async function () {
+      // 0. Deletion guard: Verify that the source message still exists in writingMessages
+      const sourceMessage = await targetDb.writingMessages.get(messageId);
+      if (!sourceMessage) {
+        return {
+          knowledgeId: 0,
+          isNewKnowledge: false,
+          abortedDueToDeletion: true,
+        };
+      }
+
       // 1. Check for existing active knowledge item with the same category, subject, and predicate
       const existingItem = await targetDb.personalKnowledge
         .where('category')
@@ -703,7 +733,7 @@ export async function persistGroundedKnowledge(
 
         if (duplicateEvidence) {
           // Already linked; do not insert duplicate evidence
-          return { knowledgeId: targetKnowledgeId, isNewKnowledge: false };
+          return { knowledgeId: targetKnowledgeId, isNewKnowledge: false, abortedDueToDeletion: false };
         }
 
         // Update lastConfirmedAt on the existing knowledge item
@@ -745,7 +775,7 @@ export async function persistGroundedKnowledge(
         .first();
 
       if (existingEvidence) {
-        return { knowledgeId: targetKnowledgeId, isNewKnowledge };
+        return { knowledgeId: targetKnowledgeId, isNewKnowledge, abortedDueToDeletion: false };
       }
 
       // 2. Insert linked knowledge evidence row atomically
@@ -758,9 +788,110 @@ export async function persistGroundedKnowledge(
         extractedAt: now,
       });
 
-      return { knowledgeId: targetKnowledgeId, isNewKnowledge };
+      return { knowledgeId: targetKnowledgeId, isNewKnowledge, abortedDueToDeletion: false };
     }
   );
+}
+
+/**
+ * Reusable single-message knowledge extraction function.
+ * Extracts personal knowledge from a single writing message using the local Ollama pipeline.
+ *
+ * Requirements:
+ * 1. Requires a persisted message with a valid numeric ID.
+ * 2. Verifies the message exists in the database before calling Ollama.
+ * 3. Returns an explicit 'aborted_deleted' result if the message does not exist.
+ * 4. Calls existing queryOllamaJson() with model 'qwen3.5:2b'.
+ * 5. Validates extraction drafts against original source text using parseExtractionResponse().
+ * 6. Persists each valid grounded draft via the hardened persistGroundedKnowledge() transaction.
+ * 7. If the source message is deleted during Ollama inference, the persistence transaction aborts and returns 'aborted_deleted'.
+ * 8. Does NOT mark messages as processed in storage (cache ownership remains with caller).
+ */
+export async function extractKnowledgeFromMessage(
+  message: WritingMessage,
+  options: ExtractKnowledgeOptions = {}
+): Promise<ExtractSingleMessageResult> {
+  if (typeof message.id !== 'number' || isNaN(message.id)) {
+    throw new Error('extractKnowledgeFromMessage requires a persisted message with a valid numeric id.');
+  }
+
+  const messageId = message.id;
+  const targetDb = options.targetDb || db;
+  const ollamaOptions = options.ollamaOptions || {};
+
+  if (!targetDb.isOpen()) {
+    await targetDb.open();
+  }
+
+  // 1. Verify source message exists in database before invoking Ollama
+  const preCheck = await targetDb.writingMessages.get(messageId);
+  if (!preCheck) {
+    return {
+      messageId,
+      outcome: 'aborted_deleted',
+      extractedCount: 0,
+      duplicateCount: 0,
+    };
+  }
+
+  // 2. Query Ollama in JSON mode (errors propagate to caller)
+  const rawJson = await queryOllamaJson(message.text, ollamaOptions);
+
+  // 3. Parse and ground against original source message text
+  const drafts = parseExtractionResponse(rawJson, message.text);
+
+  if (drafts.length === 0) {
+    // Re-verify message was not deleted while Ollama was running
+    const postCheck = await targetDb.writingMessages.get(messageId);
+    if (!postCheck) {
+      return {
+        messageId,
+        outcome: 'aborted_deleted',
+        extractedCount: 0,
+        duplicateCount: 0,
+      };
+    }
+
+    return {
+      messageId,
+      outcome: 'empty',
+      extractedCount: 0,
+      duplicateCount: 0,
+    };
+  }
+
+  let extractedCount = 0;
+  let duplicateCount = 0;
+  let abortedDueToDeletion = false;
+
+  for (const draft of drafts) {
+    const persistResult = await persistGroundedKnowledge(draft, messageId, targetDb);
+    if (persistResult.abortedDueToDeletion) {
+      abortedDueToDeletion = true;
+      break;
+    }
+    if (persistResult.isNewKnowledge) {
+      extractedCount++;
+    } else {
+      duplicateCount++;
+    }
+  }
+
+  if (abortedDueToDeletion) {
+    return {
+      messageId,
+      outcome: 'aborted_deleted',
+      extractedCount: 0,
+      duplicateCount: 0,
+    };
+  }
+
+  return {
+    messageId,
+    outcome: extractedCount > 0 || duplicateCount > 0 ? 'extracted' : 'empty',
+    extractedCount,
+    duplicateCount,
+  };
 }
 
 /**
@@ -911,28 +1042,26 @@ export async function runKnowledgeExtraction(
     }
 
     try {
-      // Query Ollama in JSON mode with thinking disabled for fast CPU inference
-      const rawJson = await queryOllamaJson(candidate.text, ollamaOptions);
+      const result = await extractKnowledgeFromMessage(candidate, {
+        targetDb,
+        ollamaOptions,
+      });
 
-      // Parse and ground against original source message text
-      const drafts = parseExtractionResponse(rawJson, candidate.text);
-
-      if (drafts.length === 0) {
-        summary.emptyResultCount++;
+      if (result.outcome === 'aborted_deleted') {
+        // Source message was deleted during extraction; do not count as extracted or mark as processed
+        summary.skippedCount++;
       } else {
-        for (const draft of drafts) {
-          const result = await persistGroundedKnowledge(draft, candidate.id!, targetDb);
-          if (result.isNewKnowledge) {
-            summary.extractedCount++;
-          } else {
-            summary.duplicateCount++;
-          }
+        if (result.outcome === 'empty') {
+          summary.emptyResultCount++;
+        } else {
+          summary.extractedCount += result.extractedCount;
+          summary.duplicateCount += result.duplicateCount;
         }
-      }
 
-      // Mark this message ID as processed immediately in storage so progress is saved incrementally
-      await markMessagesAsProcessed([candidate.id!]);
-      newlyProcessedCandidateIds.push(candidate.id!);
+        // Mark this message ID as processed immediately in storage so progress is saved incrementally
+        await markMessagesAsProcessed([candidate.id!]);
+        newlyProcessedCandidateIds.push(candidate.id!);
+      }
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       summary.errors.push(`Message #${candidate.id}: ${errorMsg}`);

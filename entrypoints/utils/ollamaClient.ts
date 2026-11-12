@@ -23,6 +23,25 @@ export interface OllamaStatus {
   error?: string;
 }
 
+export type OllamaErrorKind =
+  | 'offline'
+  | 'blocked_origin'
+  | 'model_missing'
+  | 'timeout'
+  | 'empty_response'
+  | 'http_error';
+
+export class OllamaError extends Error {
+  constructor(
+    message: string,
+    public readonly kind: OllamaErrorKind,
+    public readonly statusCode?: number
+  ) {
+    super(message);
+    this.name = 'OllamaError';
+  }
+}
+
 export interface OllamaClientOptions {
   baseUrl?: string;
   model?: string;
@@ -267,37 +286,52 @@ export async function queryOllamaJson(
     });
 
     if (res.status === 403) {
-      throw new Error(
-        'Ollama rejected the request origin (403 Forbidden). Set OLLAMA_ORIGINS to allow this extension (e.g. chrome-extension://<id>) and restart Ollama.'
+      throw new OllamaError(
+        'Ollama rejected the request origin (403 Forbidden). Set OLLAMA_ORIGINS to allow this extension (e.g. chrome-extension://<id>) and restart Ollama.',
+        'blocked_origin',
+        403
       );
     }
 
     if (res.status === 404) {
-      throw new Error(
-        `Model "${model}" not found in Ollama. Pull it via: ollama pull ${model}`
+      throw new OllamaError(
+        `Model "${model}" not found in Ollama. Pull it via: ollama pull ${model}`,
+        'model_missing',
+        404
       );
     }
 
     if (!res.ok) {
-      throw new Error(`Ollama returned HTTP error ${res.status}: ${res.statusText}`);
+      throw new OllamaError(
+        `Ollama returned HTTP error ${res.status}: ${res.statusText}`,
+        'http_error',
+        res.status
+      );
     }
 
     const data = (await res.json()) as OllamaChatResponse;
     const content = data.message?.content?.trim();
 
     if (!content) {
-      throw new Error('Ollama returned an empty response.');
+      throw new OllamaError('Ollama returned an empty response.', 'empty_response');
     }
 
     return content;
   } catch (err: unknown) {
+    if (err instanceof OllamaError) {
+      throw err;
+    }
     if (err instanceof Error) {
       if (err.name === 'AbortError') {
-        throw new Error(`Ollama request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+        throw new OllamaError(
+          `Ollama request timed out after ${Math.round(timeoutMs / 1000)}s.`,
+          'timeout'
+        );
       }
       if (err.message.includes('ECONNREFUSED') || err.message.includes('fetch failed')) {
-        throw new Error(
-          'Ollama is offline or unreachable at http://localhost:11434. Please start Ollama.'
+        throw new OllamaError(
+          'Ollama is offline or unreachable at http://localhost:11434. Please start Ollama.',
+          'offline'
         );
       }
       throw err;

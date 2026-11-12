@@ -10,11 +10,15 @@ import {
 } from './database';
 import {
   clearProcessedMessagesCache,
+  extractKnowledgeFromMessage,
   getProcessedMessageIds,
   parseExtractionResponse,
   persistGroundedKnowledge,
   runKnowledgeExtraction,
   validateAndGroundItem,
+  type ExtractSingleMessageResult,
+  type ExtractionOutcome,
+  type PersistGroundedKnowledgeResult,
   type RawExtractedItem,
   type ValidatedKnowledgeDraft,
 } from './knowledgeExtractor';
@@ -354,6 +358,15 @@ describe('Knowledge Extraction Suite', function () {
       await testDb.open();
 
       const messageId = 100;
+      await testDb.writingMessages.put({
+        id: messageId,
+        platform: 'ChatGPT',
+        text: 'building an extension called Echo',
+        createdAt: new Date(),
+        capturedAt: new Date(),
+        trainingStatus: 'pending',
+      });
+
       const draft: ValidatedKnowledgeDraft = {
         category: 'projects',
         subject: 'Echo Extension',
@@ -368,6 +381,7 @@ describe('Knowledge Extraction Suite', function () {
 
       const result = await persistGroundedKnowledge(draft, messageId, testDb);
       expect(result.isNewKnowledge).toBe(true);
+      expect(result.abortedDueToDeletion).toBe(false);
       expect(result.knowledgeId).toBeTypeOf('number');
 
       // Verify personalKnowledge row
@@ -389,10 +403,54 @@ describe('Knowledge Extraction Suite', function () {
       expect(evidence[0]?.isValid).toBe(true);
     });
 
+    it('should abort persistence when the source message does not exist in writingMessages', async function () {
+      const dbName = createUniqueDbName('MissingSourceMessage');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const draft: ValidatedKnowledgeDraft = {
+        category: 'projects',
+        subject: 'Ghost Project',
+        predicate: 'created',
+        value: 'does not exist',
+        sourceExcerpt: 'created a ghost project',
+        confidence: 'high',
+        importance: 'primary',
+        stability: 'evolving',
+      };
+
+      // ID 9999 was never saved in writingMessages
+      const result = await persistGroundedKnowledge(draft, 9999, testDb);
+      expect(result.abortedDueToDeletion).toBe(true);
+      expect(result.isNewKnowledge).toBe(false);
+      expect(result.knowledgeId).toBe(0);
+
+      // Verify nothing was inserted in personalKnowledge or knowledgeEvidence
+      expect(await testDb.personalKnowledge.count()).toBe(0);
+      expect(await testDb.knowledgeEvidence.count()).toBe(0);
+    });
+
     it('should deduplicate existing active knowledge and link new evidence without duplicate knowledge', async function () {
       const dbName = createUniqueDbName('DeduplicationTest');
       const testDb = trackDb(createEchoDatabase(dbName));
       await testDb.open();
+
+      await testDb.writingMessages.put({
+        id: 1,
+        platform: 'ChatGPT',
+        text: 'I am proficient in TypeScript for frontend',
+        createdAt: new Date(),
+        capturedAt: new Date(),
+        trainingStatus: 'pending',
+      });
+      await testDb.writingMessages.put({
+        id: 2,
+        platform: 'ChatGPT',
+        text: 'TypeScript is my daily language',
+        createdAt: new Date(),
+        capturedAt: new Date(),
+        trainingStatus: 'pending',
+      });
 
       const draft1: ValidatedKnowledgeDraft = {
         category: 'skills',
@@ -408,6 +466,7 @@ describe('Knowledge Extraction Suite', function () {
       // Message 1 creates the item
       const res1 = await persistGroundedKnowledge(draft1, 1, testDb);
       expect(res1.isNewKnowledge).toBe(true);
+      expect(res1.abortedDueToDeletion).toBe(false);
 
       // Message 2 mentions the exact same fact (case-insensitive subject/predicate match)
       const draft2: ValidatedKnowledgeDraft = {
@@ -423,6 +482,7 @@ describe('Knowledge Extraction Suite', function () {
 
       const res2 = await persistGroundedKnowledge(draft2, 2, testDb);
       expect(res2.isNewKnowledge).toBe(false);
+      expect(res2.abortedDueToDeletion).toBe(false);
       expect(res2.knowledgeId).toBe(res1.knowledgeId);
 
       // Total knowledge count must still be 1
@@ -443,6 +503,15 @@ describe('Knowledge Extraction Suite', function () {
       const dbName = createUniqueDbName('DuplicateEvidenceTest');
       const testDb = trackDb(createEchoDatabase(dbName));
       await testDb.open();
+
+      await testDb.writingMessages.put({
+        id: 5,
+        platform: 'ChatGPT',
+        text: 'Whenever I am stuck I use AI',
+        createdAt: new Date(),
+        capturedAt: new Date(),
+        trainingStatus: 'pending',
+      });
 
       const draft: ValidatedKnowledgeDraft = {
         category: 'habits',
@@ -474,6 +543,23 @@ describe('Knowledge Extraction Suite', function () {
       const dbName = createUniqueDbName('ConfidencePreservation');
       const testDb = trackDb(createEchoDatabase(dbName));
       await testDb.open();
+
+      await testDb.writingMessages.put({
+        id: 10,
+        platform: 'ChatGPT',
+        text: 'I am learning Python for data science',
+        createdAt: new Date(),
+        capturedAt: new Date(),
+        trainingStatus: 'pending',
+      });
+      await testDb.writingMessages.put({
+        id: 11,
+        platform: 'ChatGPT',
+        text: 'learning Python for data science',
+        createdAt: new Date(),
+        capturedAt: new Date(),
+        trainingStatus: 'pending',
+      });
 
       const draft1: ValidatedKnowledgeDraft = {
         category: 'skills',
@@ -513,6 +599,15 @@ describe('Knowledge Extraction Suite', function () {
       const dbName = createUniqueDbName('TransactionIdempotency');
       const testDb = trackDb(createEchoDatabase(dbName));
       await testDb.open();
+
+      await testDb.writingMessages.put({
+        id: 20,
+        platform: 'ChatGPT',
+        text: 'created an interactive portfolio website',
+        createdAt: new Date(),
+        capturedAt: new Date(),
+        trainingStatus: 'pending',
+      });
 
       const draft: ValidatedKnowledgeDraft = {
         category: 'projects',
@@ -1312,6 +1407,535 @@ describe('Knowledge Extraction Suite', function () {
         };
         expect(validateAndGroundItem(questionItem, pureQuestion)).toBeNull();
       });
+    });
+  });
+
+  describe('5. Deletion Race & Concurrent Operations', function () {
+    it('should abort persistence and create zero knowledge/evidence when message is deleted during Ollama inference', async function () {
+      const dbName = createUniqueDbName('DeletionDuringInference');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'Recently I built an automated reporting engine using Python.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      let resolveOllama!: (val: string) => void;
+      const ollamaPromise = new Promise<string>((resolve) => {
+        resolveOllama = resolve;
+      });
+
+      const ollamaSpy = vi.spyOn(ollamaClient, 'queryOllamaJson').mockReturnValue(ollamaPromise);
+
+      const savedMsg = (await testDb.writingMessages.get(msgId))!;
+      const extractPromise = extractKnowledgeFromMessage(savedMsg, { targetDb: testDb });
+
+      // While Ollama is still processing, the user deletes the source message
+      await deleteWritingMessage(msgId, testDb);
+      expect(await testDb.writingMessages.get(msgId)).toBeUndefined();
+
+      // Now Ollama returns with a valid extracted knowledge payload
+      resolveOllama(
+        JSON.stringify({
+          knowledge: [
+            {
+              category: 'projects',
+              subject: 'automated reporting engine',
+              predicate: 'built',
+              value: 'using Python',
+              sourceExcerpt: 'Recently I built an automated reporting engine using Python',
+              confidence: 'high',
+              importance: 'primary',
+            },
+          ],
+        })
+      );
+
+      const result = await extractPromise;
+      expect(result.outcome).toBe('aborted_deleted');
+      expect(result.extractedCount).toBe(0);
+      expect(result.duplicateCount).toBe(0);
+
+      // Verify no knowledge items and no evidence rows exist
+      expect(await testDb.personalKnowledge.count()).toBe(0);
+      expect(await testDb.knowledgeEvidence.count()).toBe(0);
+      expect(ollamaSpy).toHaveBeenCalled();
+    });
+
+    it('should scrub evidence and archive knowledge when source message is deleted after persistence', async function () {
+      const dbName = createUniqueDbName('DeletionAfterPersistence');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I designed a distributed cache in Rust for low latency.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      vi.spyOn(ollamaClient, 'queryOllamaJson').mockResolvedValue(
+        JSON.stringify({
+          knowledge: [
+            {
+              category: 'projects',
+              subject: 'distributed cache',
+              predicate: 'designed',
+              value: 'in Rust for low latency',
+              sourceExcerpt: 'I designed a distributed cache in Rust for low latency',
+              confidence: 'high',
+              importance: 'primary',
+            },
+          ],
+        })
+      );
+
+      const savedMsg = (await testDb.writingMessages.get(msgId))!;
+      const result = await extractKnowledgeFromMessage(savedMsg, { targetDb: testDb });
+
+      expect(result.outcome).toBe('extracted');
+      expect(result.extractedCount).toBe(1);
+
+      // Verify knowledge and evidence were created
+      const knowledgeItems = await testDb.personalKnowledge.toArray();
+      expect(knowledgeItems).toHaveLength(1);
+      const kId = knowledgeItems[0]!.id!;
+      const evidenceRows = await testDb.knowledgeEvidence.where('knowledgeId').equals(kId).toArray();
+      expect(evidenceRows).toHaveLength(1);
+
+      // Now delete message
+      await deleteWritingMessage(msgId, testDb);
+
+      // Verify message deleted
+      expect(await testDb.writingMessages.get(msgId)).toBeUndefined();
+
+      // Verify knowledge archived and scrubbed
+      const archivedK = await testDb.personalKnowledge.get(kId);
+      expect(archivedK?.status).toBe('archived');
+      expect(archivedK?.subject).toBe('');
+      expect(archivedK?.value).toBe('');
+
+      // Verify evidence invalidated and scrubbed
+      const scrubbedEv = await testDb.knowledgeEvidence.where('knowledgeId').equals(kId).first();
+      expect(scrubbedEv?.isValid).toBe(false);
+      expect(scrubbedEv?.sourceExcerpt).toBe('');
+      expect(scrubbedEv?.relevanceNote).toBe('');
+    });
+  });
+
+  describe('6. Reusable extractKnowledgeFromMessage()', function () {
+    it('should require a persisted message with a valid numeric id', async function () {
+      await expect(
+        extractKnowledgeFromMessage({
+          platform: 'ChatGPT',
+          text: 'I am learning Go for systems programming.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        })
+      ).rejects.toThrow(
+        'extractKnowledgeFromMessage requires a persisted message with a valid numeric id.'
+      );
+    });
+
+    it('should return aborted_deleted if source message does not exist before calling Ollama', async function () {
+      const dbName = createUniqueDbName('NonExistentPreCheck');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const ollamaSpy = vi.spyOn(ollamaClient, 'queryOllamaJson');
+
+      const result = await extractKnowledgeFromMessage(
+        {
+          id: 8888,
+          platform: 'ChatGPT',
+          text: 'I built an iOS app using Swift.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        { targetDb: testDb }
+      );
+
+      expect(result.outcome).toBe('aborted_deleted');
+      expect(result.extractedCount).toBe(0);
+      expect(result.duplicateCount).toBe(0);
+      // Ollama should never have been invoked
+      expect(ollamaSpy).not.toHaveBeenCalled();
+    });
+
+    it('should extract valid grounded knowledge and return outcome extracted with counts', async function () {
+      const dbName = createUniqueDbName('ValidSingleExtract');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I built a modern CLI tool in Go for container management.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      vi.spyOn(ollamaClient, 'queryOllamaJson').mockResolvedValue(
+        JSON.stringify({
+          knowledge: [
+            {
+              category: 'projects',
+              subject: 'CLI tool',
+              predicate: 'built',
+              value: 'in Go for container management',
+              sourceExcerpt: 'I built a modern CLI tool in Go for container management',
+              confidence: 'high',
+              importance: 'primary',
+            },
+          ],
+        })
+      );
+
+      const msg = (await testDb.writingMessages.get(msgId))!;
+      const result = await extractKnowledgeFromMessage(msg, { targetDb: testDb });
+
+      expect(result.outcome).toBe('extracted');
+      expect(result.extractedCount).toBe(1);
+      expect(result.duplicateCount).toBe(0);
+
+      const items = await testDb.personalKnowledge.toArray();
+      expect(items).toHaveLength(1);
+      expect(items[0]?.subject).toBe('CLI tool');
+    });
+
+    it('should handle empty knowledge response and return outcome empty', async function () {
+      const dbName = createUniqueDbName('EmptySingleExtract');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'Technology today changes fast and nobody knows what is next.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      vi.spyOn(ollamaClient, 'queryOllamaJson').mockResolvedValue(
+        JSON.stringify({
+          knowledge: [],
+        })
+      );
+
+      const msg = (await testDb.writingMessages.get(msgId))!;
+      const result = await extractKnowledgeFromMessage(msg, { targetDb: testDb });
+
+      expect(result.outcome).toBe('empty');
+      expect(result.extractedCount).toBe(0);
+      expect(result.duplicateCount).toBe(0);
+      expect(await testDb.personalKnowledge.count()).toBe(0);
+    });
+
+    it('should handle duplicate knowledge response and increment duplicateCount', async function () {
+      const dbName = createUniqueDbName('DuplicateSingleExtract');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msg1Id = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I learned React for building interactive frontend apps.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      const msg2Id = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I also learned React for frontend earlier this year.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      vi.spyOn(ollamaClient, 'queryOllamaJson').mockImplementation(async (prompt) => {
+        if (prompt.includes('earlier this year')) {
+          return JSON.stringify({
+            knowledge: [
+              {
+                category: 'skills',
+                subject: 'React',
+                predicate: 'learned',
+                value: 'for frontend',
+                sourceExcerpt: 'I also learned React for frontend earlier this year',
+                confidence: 'high',
+                importance: 'primary',
+              },
+            ],
+          });
+        }
+        return JSON.stringify({
+          knowledge: [
+            {
+              category: 'skills',
+              subject: 'React',
+              predicate: 'learned',
+              value: 'for frontend',
+              sourceExcerpt: 'I learned React for building interactive frontend apps',
+              confidence: 'high',
+              importance: 'primary',
+            },
+          ],
+        });
+      });
+
+      const msg1 = (await testDb.writingMessages.get(msg1Id))!;
+      const res1 = await extractKnowledgeFromMessage(msg1, { targetDb: testDb });
+      expect(res1.outcome).toBe('extracted');
+      expect(res1.extractedCount).toBe(1);
+      expect(res1.duplicateCount).toBe(0);
+
+      const msg2 = (await testDb.writingMessages.get(msg2Id))!;
+      const res2 = await extractKnowledgeFromMessage(msg2, { targetDb: testDb });
+      expect(res2.outcome).toBe('extracted');
+      expect(res2.extractedCount).toBe(0);
+      expect(res2.duplicateCount).toBe(1); // Corroborated!
+
+      // Only 1 knowledge item exists
+      expect(await testDb.personalKnowledge.count()).toBe(1);
+      // 2 evidence links exist
+      expect(await testDb.knowledgeEvidence.count()).toBe(2);
+    });
+
+    it('should propagate Ollama network or timeout errors to the caller', async function () {
+      const dbName = createUniqueDbName('OllamaErrorPropagate');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I am building an embedded firmware driver in C.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      vi.spyOn(ollamaClient, 'queryOllamaJson').mockRejectedValue(
+        new Error('Ollama request timed out after 60s.')
+      );
+
+      const msg = (await testDb.writingMessages.get(msgId))!;
+      await expect(
+        extractKnowledgeFromMessage(msg, { targetDb: testDb })
+      ).rejects.toThrow('Ollama request timed out after 60s.');
+    });
+  });
+
+  describe('7. runKnowledgeExtraction() Compatibility & Processed Cache', function () {
+    it('should mark successfully evaluated empty-result messages as processed in storage', async function () {
+      const dbName = createUniqueDbName('EmptyResultProcessed');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'In my opinion software is always evolving, which is very interesting to observe.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'qwen3.5:2b',
+      });
+
+      vi.spyOn(ollamaClient, 'queryOllamaJson').mockResolvedValue(
+        JSON.stringify({
+          knowledge: [],
+        })
+      );
+
+      const summary = await runKnowledgeExtraction({ targetDb: testDb });
+      expect(summary.emptyResultCount).toBe(1);
+      expect(summary.extractedCount).toBe(0);
+
+      // Successfully evaluated empty results must be marked processed
+      const processed = await getProcessedMessageIds();
+      expect(processed.has(msgId)).toBe(true);
+    });
+
+    it('should NOT mark failed extraction messages as processed so they can be retried', async function () {
+      const dbName = createUniqueDbName('FailedNotProcessed');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I built an inventory service using Go and MongoDB.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'qwen3.5:2b',
+      });
+
+      vi.spyOn(ollamaClient, 'queryOllamaJson').mockRejectedValue(
+        new Error('Ollama request timed out after 60s.')
+      );
+
+      const summary = await runKnowledgeExtraction({ targetDb: testDb });
+      expect(summary.errors).toHaveLength(1);
+      expect(summary.errors[0]).toContain(`Message #${msgId}`);
+
+      // Failed message must NOT be in processed cache
+      const processed = await getProcessedMessageIds();
+      expect(processed.has(msgId)).toBe(false);
+    });
+
+    it('should NOT mark messages aborted due to deletion as processed', async function () {
+      const dbName = createUniqueDbName('AbortedDeletedNotProcessed');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I created a custom game engine in C++ from scratch.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'qwen3.5:2b',
+      });
+
+      // While queryOllamaJson is called, delete the message
+      vi.spyOn(ollamaClient, 'queryOllamaJson').mockImplementation(async () => {
+        await deleteWritingMessage(msgId, testDb);
+        return JSON.stringify({
+          knowledge: [
+            {
+              category: 'projects',
+              subject: 'game engine',
+              predicate: 'created',
+              value: 'in C++ from scratch',
+              sourceExcerpt: 'I created a custom game engine in C++ from scratch',
+              confidence: 'high',
+              importance: 'primary',
+            },
+          ],
+        });
+      });
+
+      const summary = await runKnowledgeExtraction({ targetDb: testDb });
+      expect(summary.skippedCount).toBe(1);
+      expect(summary.extractedCount).toBe(0);
+
+      // Aborted deleted message must NOT be marked processed
+      const processed = await getProcessedMessageIds();
+      expect(processed.has(msgId)).toBe(false);
+    });
+
+    it('should re-evaluate messages when forceAll is true', async function () {
+      const dbName = createUniqueDbName('ForceAllTest');
+      const testDb = trackDb(createEchoDatabase(dbName));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I built an online marketplace using React and Node.js.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'qwen3.5:2b',
+      });
+
+      vi.spyOn(ollamaClient, 'queryOllamaJson').mockResolvedValue(
+        JSON.stringify({
+          knowledge: [
+            {
+              category: 'projects',
+              subject: 'online marketplace',
+              predicate: 'built',
+              value: 'using React and Node.js',
+              sourceExcerpt: 'I built an online marketplace using React and Node.js',
+              confidence: 'high',
+              importance: 'primary',
+            },
+          ],
+        })
+      );
+
+      // First run: extracts
+      const summary1 = await runKnowledgeExtraction({ targetDb: testDb });
+      expect(summary1.extractedCount).toBe(1);
+
+      // Second run without forceAll: skips because already processed
+      const summary2 = await runKnowledgeExtraction({ targetDb: testDb });
+      expect(summary2.candidateCount).toBe(0);
+
+      // Third run with forceAll: true: candidate evaluated again
+      const summary3 = await runKnowledgeExtraction({ targetDb: testDb, forceAll: true });
+      expect(summary3.candidateCount).toBe(1);
+      expect(summary3.duplicateCount).toBe(1); // Corroborated without duplicating
     });
   });
 });

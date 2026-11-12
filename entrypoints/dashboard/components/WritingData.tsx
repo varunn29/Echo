@@ -11,6 +11,8 @@ import {
   AlertCircle,
   Loader2,
   FileText,
+  Clock,
+  RotateCcw,
 } from 'lucide-react';
 
 import {
@@ -26,15 +28,11 @@ import {
   DEFAULT_OLLAMA_MODEL,
 } from '../../utils/ollamaClient';
 import {
-  runKnowledgeExtraction,
-  type ExtractionProgress,
-  type ExtractionSummary,
-} from '../../utils/knowledgeExtractor';
-import {
   importSampleWritingSamples,
   type IngestionResult,
   SAMPLE_WRITING_SAMPLES,
 } from '../../utils/sampleWritingIngestion';
+import type { KnowledgeCoordinatorStatus } from '../../utils/knowledgeCoordinator';
 
 function WritingData() {
   const [messages, setMessages] = useState<WritingMessage[]>([]);
@@ -50,13 +48,13 @@ function WritingData() {
   const [ingestionSummary, setIngestionSummary] = useState<IngestionResult | null>(null);
   const [ingestionError, setIngestionError] = useState('');
 
-  // Ollama & Extraction states
+  // Ollama & Coordinator states
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
   const [isCheckingOllama, setIsCheckingOllama] = useState(false);
-  const [isExtracting, setIsExtracting] = useState(false);
-  const [extractionProgress, setExtractionProgress] = useState<ExtractionProgress | null>(null);
-  const [extractionSummary, setExtractionSummary] = useState<ExtractionSummary | null>(null);
-  const [extractionError, setExtractionError] = useState('');
+  const [coordinatorStatus, setCoordinatorStatus] = useState<KnowledgeCoordinatorStatus | null>(null);
+  const [isActionSubmitting, setIsActionSubmitting] = useState(false);
+  const [actionFeedback, setActionFeedback] = useState('');
+  const [actionError, setActionError] = useState('');
 
   async function loadData() {
     try {
@@ -91,74 +89,169 @@ function WritingData() {
     }
   }
 
+  async function fetchCoordinatorStatus() {
+    try {
+      if (typeof browser !== 'undefined' && browser.runtime?.sendMessage) {
+        const response = await browser.runtime.sendMessage({
+          type: 'GET_KNOWLEDGE_COORDINATOR_STATUS',
+        });
+        if (response?.success && response.status) {
+          setCoordinatorStatus(response.status);
+        }
+      }
+    } catch (err) {
+      console.warn('Echo: Failed to fetch coordinator status:', err);
+    }
+  }
+
   useEffect(() => {
     loadData();
     checkOllama();
+    fetchCoordinatorStatus();
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === 'visible') {
+        loadData();
+        checkOllama();
+        fetchCoordinatorStatus();
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, []);
 
-  async function handleExtractKnowledge() {
-    if (isExtracting) return;
-    setIsExtracting(true);
-    setExtractionError('');
-    setExtractionSummary(null);
+  // Poll only while extraction is actively running in background
+  useEffect(() => {
+    if (!coordinatorStatus?.isProcessing) return;
+
+    const timer = setInterval(() => {
+      fetchCoordinatorStatus();
+      loadData();
+    }, 2000);
+
+    return () => clearInterval(timer);
+  }, [coordinatorStatus?.isProcessing]);
+
+  async function handleStartExtraction() {
+    if (isActionSubmitting || coordinatorStatus?.isProcessing) return;
+    setIsActionSubmitting(true);
+    setActionError('');
+    setActionFeedback('');
 
     try {
-      const summary = await runKnowledgeExtraction({
-        onProgress: (progress) => {
-          setExtractionProgress(progress);
-        },
-      });
+      if (typeof browser !== 'undefined' && browser.runtime?.sendMessage) {
+        const response = await browser.runtime.sendMessage({
+          type: 'START_KNOWLEDGE_EXTRACTION',
+        });
 
-      setExtractionSummary(summary);
-      // Reload knowledge and messages
-      await loadData();
-      if (summary.extractedCount > 0) {
-        setActiveTab('knowledge');
+        if (response?.success) {
+          const res = response.result;
+          if (res?.status === 'completed') {
+            setActionFeedback(`Extraction complete: ${res.processedCount} message(s) evaluated.`);
+          } else if (res?.status === 'already_running') {
+            setActionFeedback('Extraction is already in progress.');
+          } else if (res?.status === 'service_offline') {
+            setActionError('Ollama is offline. Start Ollama to begin extraction.');
+          } else if (res?.status === 'service_blocked') {
+            setActionError(`Extraction blocked: ${res.error || 'Model not installed or origin rejected.'}`);
+          } else if (res?.status === 'empty') {
+            setActionFeedback('No pending messages waiting for extraction.');
+          }
+          await fetchCoordinatorStatus();
+          await loadData();
+          if (res?.processedCount > 0) {
+            setActiveTab('knowledge');
+          }
+        } else {
+          setActionError(response?.error || 'Failed to start knowledge extraction.');
+        }
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      setExtractionError(msg);
+      setActionError(msg);
     } finally {
-      setIsExtracting(false);
-      setExtractionProgress(null);
+      setIsActionSubmitting(false);
+    }
+  }
+
+  async function handleRetryFailed() {
+    if (isActionSubmitting) return;
+    setIsActionSubmitting(true);
+    setActionError('');
+    setActionFeedback('');
+
+    try {
+      if (typeof browser !== 'undefined' && browser.runtime?.sendMessage) {
+        const response = await browser.runtime.sendMessage({
+          type: 'RETRY_FAILED_KNOWLEDGE_MESSAGES',
+        });
+
+        if (response?.success) {
+          setActionFeedback(`Requeued ${response.requeuedCount} failed message(s) for extraction.`);
+          await fetchCoordinatorStatus();
+          await loadData();
+        } else {
+          setActionError(response?.error || 'Failed to retry failed messages.');
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setActionError(msg);
+    } finally {
+      setIsActionSubmitting(false);
+    }
+  }
+
+  async function handleReconsiderSkipped() {
+    if (isActionSubmitting) return;
+    setIsActionSubmitting(true);
+    setActionError('');
+    setActionFeedback('');
+
+    try {
+      if (typeof browser !== 'undefined' && browser.runtime?.sendMessage) {
+        const response = await browser.runtime.sendMessage({
+          type: 'RECONSIDER_SKIPPED_KNOWLEDGE_MESSAGES',
+        });
+
+        if (response?.success) {
+          setActionFeedback(
+            `Reconsidered skipped messages: ${response.requeuedCount} re-enqueued for extraction.`
+          );
+          await fetchCoordinatorStatus();
+          await loadData();
+        } else {
+          setActionError(response?.error || 'Failed to reconsider skipped messages.');
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setActionError(msg);
+    } finally {
+      setIsActionSubmitting(false);
     }
   }
 
   async function handleImportSampleWriting() {
-    if (isImporting || isExtracting) return;
+    if (isImporting || isActionSubmitting) return;
     setIsImporting(true);
     setIngestionError('');
     setIngestionSummary(null);
+    setActionFeedback('');
 
     try {
       const result = await importSampleWritingSamples();
       setIngestionSummary(result);
       await loadData();
 
-      // If Ollama is running and model is ready, automatically extract knowledge from newly imported messages
-      if (ollamaStatus?.isRunning && ollamaStatus?.isModelReady && result.importedCount > 0) {
-        setIsExtracting(true);
-        setExtractionError('');
-        setExtractionSummary(null);
-        try {
-          const summary = await runKnowledgeExtraction({
-            messages: result.messages,
-            onProgress: (progress) => {
-              setExtractionProgress(progress);
-            },
-          });
-          setExtractionSummary(summary);
-          await loadData();
-          if (summary.extractedCount > 0) {
-            setActiveTab('knowledge');
-          }
-        } catch (extractErr) {
-          const msg = extractErr instanceof Error ? extractErr.message : String(extractErr);
-          setExtractionError(msg);
-        } finally {
-          setIsExtracting(false);
-          setExtractionProgress(null);
-        }
+      // Trigger extraction through coordinator for newly imported messages
+      if (result.importedCount > 0) {
+        await handleStartExtraction();
+      } else {
+        await fetchCoordinatorStatus();
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -248,6 +341,7 @@ function WritingData() {
       await deleteWritingMessage(selectedMessageId);
       // Reload both messages and active knowledge to reflect privacy scrubbing
       await loadData();
+      await fetchCoordinatorStatus();
       setSelectedMessageId(null);
     } catch (err) {
       console.error('Echo: Failed to delete message:', err);
@@ -316,10 +410,13 @@ function WritingData() {
 
                   <button
                     type="button"
-                    onClick={checkOllama}
-                    disabled={isCheckingOllama || isExtracting}
+                    onClick={() => {
+                      checkOllama();
+                      fetchCoordinatorStatus();
+                    }}
+                    disabled={isCheckingOllama || isActionSubmitting || coordinatorStatus?.isProcessing}
                     className="ml-2 text-[#68766d] underline hover:text-[#203c30]"
-                    title="Re-check connection"
+                    title="Re-check connection and status"
                   >
                     Check
                   </button>
@@ -331,7 +428,7 @@ function WritingData() {
               <button
                 type="button"
                 onClick={handleImportSampleWriting}
-                disabled={isImporting || isExtracting}
+                disabled={isImporting || isActionSubmitting || coordinatorStatus?.isProcessing}
                 className="inline-flex items-center gap-2 rounded-xl border border-[#c6d3c2] bg-white/90 px-4 py-2.5 text-xs font-semibold text-[#203c30] shadow-sm transition-colors hover:border-[#9ab094] hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"
                 title="Import sample writing messages to test knowledge extraction"
               >
@@ -350,19 +447,20 @@ function WritingData() {
 
               <button
                 type="button"
-                onClick={handleExtractKnowledge}
+                onClick={handleStartExtraction}
                 disabled={
-                  isExtracting ||
+                  isActionSubmitting ||
+                  coordinatorStatus?.isProcessing ||
                   !ollamaStatus?.isRunning ||
                   !ollamaStatus?.isModelReady ||
                   messages.length === 0
                 }
                 className="inline-flex items-center gap-2 rounded-xl bg-[#203c30] px-5 py-2.5 text-xs font-semibold text-white shadow-sm transition-all hover:bg-[#2d5242] disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {isExtracting ? (
+                {isActionSubmitting || coordinatorStatus?.isProcessing ? (
                   <>
                     <Loader2 size={15} className="animate-spin" />
-                    Extracting Knowledge...
+                    {coordinatorStatus?.isProcessing ? 'Extracting in Background...' : 'Starting Extraction...'}
                   </>
                 ) : (
                   <>
@@ -374,54 +472,131 @@ function WritingData() {
             </div>
           </div>
 
-          {/* Extraction Live Progress */}
-          {isExtracting && extractionProgress && (
+          {/* Coordinator Status Banner / Metrics */}
+          {coordinatorStatus && (
             <div className="mt-5 border-t border-[#dce3d9]/70 pt-4">
-              <div className="flex items-center justify-between text-xs font-medium text-[#405247]">
-                <span>
-                  Analyzing candidate {extractionProgress.processedCount + 1} of{' '}
-                  {extractionProgress.totalEligible} (concurrency: 1)...
+              {/* Metrics Pill Row */}
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="rounded-lg bg-[#203c30]/5 px-2.5 py-1 font-medium text-[#203c30]">
+                  Evaluated: <strong className="font-semibold">{coordinatorStatus.extractedCount}</strong>
                 </span>
-                <span>
-                  {Math.round(
-                    (extractionProgress.processedCount /
-                      Math.max(1, extractionProgress.totalEligible)) *
-                      100
+                <span className="rounded-lg bg-amber-50 px-2.5 py-1 font-medium text-amber-800">
+                  Pending: <strong className="font-semibold">{coordinatorStatus.pendingCount}</strong>
+                </span>
+                <span className="rounded-lg bg-slate-100 px-2.5 py-1 font-medium text-slate-700">
+                  Skipped: <strong className="font-semibold">{coordinatorStatus.skippedCount}</strong>
+                </span>
+                {coordinatorStatus.failedTemporaryCount > 0 && (
+                  <span className="rounded-lg bg-orange-50 px-2.5 py-1 font-medium text-orange-700">
+                    Retrying: <strong className="font-semibold">{coordinatorStatus.failedTemporaryCount}</strong>
+                  </span>
+                )}
+                {coordinatorStatus.failedPermanentCount > 0 && (
+                  <span className="rounded-lg bg-red-50 px-2.5 py-1 font-medium text-red-700">
+                    Failed: <strong className="font-semibold">{coordinatorStatus.failedPermanentCount}</strong>
+                  </span>
+                )}
+              </div>
+
+              {/* State-specific Notice */}
+              <div className="mt-3">
+                {coordinatorStatus.isProcessing || coordinatorStatus.inFlightMessageId !== null ? (
+                  <div className="flex items-center gap-2 text-xs font-medium text-emerald-800">
+                    <Loader2 size={14} className="animate-spin text-emerald-700" />
+                    <span>
+                      Extraction currently running
+                      {coordinatorStatus.inFlightMessageId ? ` (processing message #${coordinatorStatus.inFlightMessageId})` : ''}
+                      {coordinatorStatus.pendingCount > 0 ? ` — ${coordinatorStatus.pendingCount} message(s) in queue` : ''}.
+                    </span>
+                  </div>
+                ) : coordinatorStatus.serviceStatus === 'offline' ? (
+                  <div className="flex items-center gap-2 text-xs text-amber-800">
+                    <AlertCircle size={14} className="text-amber-600" />
+                    <span>
+                      Ollama is currently offline. Background extraction is paused and will automatically resume once Ollama is online.
+                    </span>
+                  </div>
+                ) : coordinatorStatus.serviceStatus === 'blocked_configuration' ? (
+                  <div className="flex items-center gap-2 text-xs text-red-800">
+                    <AlertCircle size={14} className="text-red-600" />
+                    <span>
+                      Extraction blocked: {coordinatorStatus.serviceError || 'Model missing or origin rejected'}.
+                    </span>
+                  </div>
+                ) : coordinatorStatus.pendingCount > 0 ? (
+                  <div className="flex items-center gap-2 text-xs text-[#405247]">
+                    <Clock size={14} className="text-[#68766d]" />
+                    <span>
+                      {coordinatorStatus.pendingCount} message(s) waiting for background extraction.
+                    </span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 text-xs text-[#68766d]">
+                    <CheckCircle2 size={14} className="text-emerald-600" />
+                    <span>All collected messages have been evaluated by the background coordinator.</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Recovery Actions Row (Failed Permanent & Skipped) */}
+              {(coordinatorStatus.failedPermanentCount > 0 || coordinatorStatus.skippedCount > 0) && (
+                <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-[#dce3d9]/50 pt-3">
+                  {coordinatorStatus.failedPermanentCount > 0 && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-red-700">
+                        {coordinatorStatus.failedPermanentCount} message(s) permanently failed after 3 attempts:
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleRetryFailed}
+                        disabled={isActionSubmitting || coordinatorStatus.isProcessing}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 bg-red-50 px-3 py-1 text-xs font-semibold text-red-700 hover:bg-red-100 disabled:opacity-50"
+                      >
+                        <RefreshCw size={12} className={isActionSubmitting ? 'animate-spin' : ''} />
+                        Retry Failed
+                      </button>
+                    </div>
                   )}
-                  %
-                </span>
-              </div>
 
-              <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-[#e6ede4]">
-                <div
-                  className="h-full bg-[#356b45] transition-all duration-300"
-                  style={{
-                    width: `${Math.max(
-                      5,
-                      Math.round(
-                        (extractionProgress.processedCount /
-                          Math.max(1, extractionProgress.totalEligible)) *
-                          100
-                      )
-                    )}%`,
-                  }}
-                />
-              </div>
-
-              {extractionProgress.currentMessageText && (
-                <p className="mt-2.5 truncate text-[11px] italic text-[#68766d]">
-                  Current: "{extractionProgress.currentMessageText}"
-                </p>
+                  {coordinatorStatus.skippedCount > 0 && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-[#68766d]">
+                        {coordinatorStatus.skippedCount} non-prose / code message(s) skipped:
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleReconsiderSkipped}
+                        disabled={isActionSubmitting || coordinatorStatus.isProcessing}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-[#c6d3c2] bg-white px-3 py-1 text-xs font-semibold text-[#203c30] hover:bg-[#f0f2eb] disabled:opacity-50"
+                      >
+                        <RotateCcw size={12} className={isActionSubmitting ? 'animate-spin' : ''} />
+                        Reconsider Skipped
+                      </button>
+                    </div>
+                  )}
+                </div>
               )}
+            </div>
+          )}
+
+          {/* Action Feedback Notice */}
+          {actionFeedback && (
+            <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/80 p-3.5 text-xs text-emerald-900">
+              <p className="font-semibold">{actionFeedback}</p>
+            </div>
+          )}
+
+          {/* Action Error Notice */}
+          {actionError && (
+            <div className="mt-4 rounded-xl border border-red-200 bg-red-50/80 p-3.5 text-xs text-red-700">
+              <p className="font-semibold">{actionError}</p>
             </div>
           )}
 
           {/* Ingestion Status Notice */}
           {ingestionSummary && (
             <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50/80 p-3.5 text-xs text-blue-900">
-              <p className="font-semibold">
-                Sample Writing Ingestion:
-              </p>
+              <p className="font-semibold">Sample Writing Ingestion:</p>
               <p className="mt-1">
                 {ingestionSummary.importedCount > 0
                   ? `Successfully imported ${ingestionSummary.importedCount} sample message(s) into writing data (${ingestionSummary.existingCount} already existed).`
@@ -435,31 +610,6 @@ function WritingData() {
             <div className="mt-4 rounded-xl border border-red-200 bg-red-50/80 p-3.5 text-xs text-red-700">
               <p className="font-semibold">Ingestion failed:</p>
               <p className="mt-1">{ingestionError}</p>
-            </div>
-          )}
-
-          {/* Extraction Error Notice */}
-          {extractionError && (
-            <div className="mt-4 rounded-xl border border-red-200 bg-red-50/80 p-3.5 text-xs text-red-700">
-              <p className="font-semibold">Extraction failed:</p>
-              <p className="mt-1">{extractionError}</p>
-            </div>
-          )}
-
-          {/* Extraction Summary */}
-          {extractionSummary && (
-            <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/80 p-3.5 text-xs text-emerald-900">
-              <p className="font-semibold">
-                Extraction Complete! Analyzed {extractionSummary.totalAnalyzed} messages:
-              </p>
-              <ul className="mt-1.5 list-inside list-disc space-y-0.5 text-emerald-800">
-                <li>{extractionSummary.candidateCount} eligible prose messages evaluated</li>
-                <li>{extractionSummary.extractedCount} new personal facts extracted</li>
-                {extractionSummary.duplicateCount > 0 && (
-                  <li>{extractionSummary.duplicateCount} corroborating facts merged</li>
-                )}
-                <li>{extractionSummary.skippedCount} non-prose / code items filtered out</li>
-              </ul>
             </div>
           )}
         </div>
