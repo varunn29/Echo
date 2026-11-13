@@ -18,6 +18,7 @@ import {
   reconsiderSkippedKnowledgeMessages,
   getKnowledgeCoordinatorStatus,
   syncUntrackedKnowledgeMessages,
+  scheduleKnowledgeRetryAlarm,
   KNOWLEDGE_RETRY_ALARM_NAME,
   type CoordinatorOptions,
 } from './utils/knowledgeCoordinator';
@@ -33,10 +34,17 @@ export interface SaveMessageResponse {
 export type BackgroundOptions = CoordinatorOptions;
 
 let startupPromise: Promise<void> | null = null;
+let isRecoverySucceeded = false;
 
 /**
  * Initializes background services upon service worker startup.
  * Guaranteed to be idempotent: concurrent or repeated calls return the same in-flight promise.
+ *
+ * Phase 1 (Recovery): If recovery fails, isRecoverySucceeded remains false,
+ *                     startupPromise is cleared in finally, and a retry alarm is scheduled.
+ * Phase 2 (Startup Queue): Runs under the same startupPromise so concurrent events wait for
+ *                          startup queue draining to complete before dispatching. Any queue
+ *                          errors are logged without invalidating successful recovery.
  */
 export function initializeBackgroundServices(
   options?: BackgroundOptions
@@ -45,29 +53,78 @@ export function initializeBackgroundServices(
     return startupPromise;
   }
 
+  if (isRecoverySucceeded) {
+    return Promise.resolve();
+  }
+
   startupPromise = (async () => {
     // 1. Recover and poll active training job (independent)
     pollActiveTrainingJob({ targetDb: options?.targetDb }).catch(function (err) {
       console.warn('Echo: Startup active job poll error:', err);
     });
 
-    // 2. Recover knowledge coordinator and resume pending queue (independent)
-    try {
-      const recovery = await recoverKnowledgeCoordinator(options);
-      if (recovery.recovered) {
-        console.log('Echo: Knowledge coordinator recovered in-flight work:', recovery);
+    // 2. Knowledge Recovery Phase
+    if (!isRecoverySucceeded) {
+      try {
+        const recovery = await recoverKnowledgeCoordinator(options);
+        if (recovery.recovered) {
+          console.log('Echo: Knowledge coordinator recovered in-flight work:', recovery);
+        }
+        isRecoverySucceeded = true;
+      } catch (recoveryErr) {
+        console.warn('Echo: Startup knowledge coordinator recovery error:', recoveryErr);
+        await scheduleKnowledgeRetryAlarm().catch(() => {});
+        throw recoveryErr;
       }
-      await processKnowledgeQueue(options);
-    } catch (err) {
-      console.warn('Echo: Startup knowledge coordinator recovery error:', err);
     }
-  })();
+
+    // 3. Initial Queue Processing Phase
+    try {
+      await processKnowledgeQueue(options);
+    } catch (queueErr) {
+      console.warn('Echo: Startup knowledge queue processing error:', queueErr);
+    }
+  })().finally(() => {
+    startupPromise = null;
+  });
 
   return startupPromise;
 }
 
 export function resetBackgroundStateForTesting(): void {
   startupPromise = null;
+  isRecoverySucceeded = false;
+}
+
+export function setIsRecoverySucceededForTesting(value: boolean): void {
+  isRecoverySucceeded = value;
+}
+
+export function getIsRecoverySucceededForTesting(): boolean {
+  return isRecoverySucceeded;
+}
+
+export function getStartupPromiseForTesting(): Promise<void> | null {
+  return startupPromise;
+}
+
+/**
+ * Awaits completion of startup background services initialization.
+ * - If initialization is currently in-flight (recovery or initial queue processing),
+ *   awaits that shared promise to ensure events do not race with startup queue drain.
+ * - If recovery previously failed (or hasn't run), initiates/retries initialization.
+ * - If recovery previously succeeded and startup queue drain has finished, returns immediately.
+ */
+export async function awaitStartupBarrier(
+  options?: BackgroundOptions
+): Promise<void> {
+  if (startupPromise) {
+    await startupPromise;
+    return;
+  }
+  if (!isRecoverySucceeded) {
+    await initializeBackgroundServices(options);
+  }
 }
 
 /**
@@ -77,10 +134,10 @@ export function resetBackgroundStateForTesting(): void {
 export function handleBackgroundAlarm(
   alarm: { name: string },
   options?: BackgroundOptions
-): void {
+): Promise<void> | void {
   if (alarm.name === RETRY_ALARM_NAME) {
     console.log('Echo: Retry alarm fired. Checking training service availability...');
-    checkAndTriggerTraining({ targetDb: options?.targetDb })
+    return checkAndTriggerTraining({ targetDb: options?.targetDb })
       .then(function (res) {
         if (res.action === 'submitted' || res.action === 'insufficient_samples') {
           clearServiceRetryAlarm().catch(function () {});
@@ -91,7 +148,10 @@ export function handleBackgroundAlarm(
       });
   } else if (alarm.name === KNOWLEDGE_RETRY_ALARM_NAME) {
     console.log('Echo: Knowledge retry alarm fired. Processing knowledge queue...');
-    processKnowledgeQueue(options).catch(function (err) {
+    return (async () => {
+      await awaitStartupBarrier(options);
+      await processKnowledgeQueue(options);
+    })().catch(function (err) {
       console.warn('Echo: Knowledge retry alarm processing error:', err);
     });
   }
@@ -152,6 +212,7 @@ export function handleRuntimeMessage(
   // Handle manual knowledge extraction trigger
   if (message.type === 'START_KNOWLEDGE_EXTRACTION') {
     (async () => {
+      await awaitStartupBarrier(options);
       // Ensure any untracked writing messages in the database are enqueued in a single batch
       const targetDb = options?.targetDb || db;
       if (!targetDb.isOpen()) {
@@ -189,19 +250,19 @@ export function handleRuntimeMessage(
       return false;
     }
 
-    retryFailedKnowledgeMessages(message.messageIds, options)
-      .then(function (requeuedCount) {
-        sendResponse({ success: true, requeuedCount });
-        processKnowledgeQueue(options).catch(function (procErr) {
-          console.warn('Echo: Knowledge queue processing error after retry:', procErr);
-        });
-      })
-      .catch(function (err) {
-        sendResponse({
-          success: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
+    (async () => {
+      await awaitStartupBarrier(options);
+      const requeuedCount = await retryFailedKnowledgeMessages(message.messageIds, options);
+      sendResponse({ success: true, requeuedCount });
+      processKnowledgeQueue(options).catch(function (procErr) {
+        console.warn('Echo: Knowledge queue processing error after retry:', procErr);
       });
+    })().catch(function (err) {
+      sendResponse({
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
     return true;
   }
 
@@ -221,19 +282,19 @@ export function handleRuntimeMessage(
       return false;
     }
 
-    reconsiderSkippedKnowledgeMessages(message.messageIds, options)
-      .then(function (requeuedCount) {
-        sendResponse({ success: true, requeuedCount });
-        processKnowledgeQueue(options).catch(function (procErr) {
-          console.warn('Echo: Knowledge queue processing error after reconsider:', procErr);
-        });
-      })
-      .catch(function (err) {
-        sendResponse({
-          success: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
+    (async () => {
+      await awaitStartupBarrier(options);
+      const requeuedCount = await reconsiderSkippedKnowledgeMessages(message.messageIds, options);
+      sendResponse({ success: true, requeuedCount });
+      processKnowledgeQueue(options).catch(function (procErr) {
+        console.warn('Echo: Knowledge queue processing error after reconsider:', procErr);
       });
+    })().catch(function (err) {
+      sendResponse({
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
     return true;
   }
 
@@ -315,9 +376,13 @@ export function handleRuntimeMessage(
       enqueueKnowledgeMessage(persistedMsg, options)
         .then(function (enqueueRes) {
           if (enqueueRes.enqueued) {
-            processKnowledgeQueue(options).catch(function (processErr) {
-              console.warn('Echo: Background knowledge queue processing error:', processErr);
-            });
+            awaitStartupBarrier(options)
+              .then(function () {
+                return processKnowledgeQueue(options);
+              })
+              .catch(function (processErr) {
+                console.warn('Echo: Background knowledge queue processing error:', processErr);
+              });
           }
         })
         .catch(function (enqueueErr) {

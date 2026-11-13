@@ -29,6 +29,10 @@ import {
   type OllamaClientOptions,
   type OllamaStatus,
 } from './ollamaClient';
+import {
+  ensureOffscreenDocument,
+  closeOffscreenDocument,
+} from './offscreenManager';
 
 export const COORDINATOR_STORAGE_KEY = 'echo_knowledge_coordinator_state';
 export const KNOWLEDGE_RETRY_ALARM_NAME = 'echo_knowledge_service_retry';
@@ -106,6 +110,7 @@ export interface CoordinatorOptions {
   ollamaOptions?: OllamaClientOptions;
   cooldownMs?: number;
   sleepFn?: (ms: number) => Promise<void>;
+  manageOffscreen?: boolean;
 }
 
 export interface EnqueueResult {
@@ -170,6 +175,7 @@ export function resetInMemoryStorageForTesting(): void {
 
 // In-memory execution mutex preventing concurrent processing within the same service-worker instance
 let isProcessingQueue = false;
+let isRecoveringCoordinator = false;
 
 // Serialized mutation chain preventing lost updates during concurrent read-modify-write calls
 let mutationChain: Promise<unknown> = Promise.resolve();
@@ -177,7 +183,12 @@ let mutationChain: Promise<unknown> = Promise.resolve();
 export function resetCoordinatorStateForTesting(): void {
   inMemoryStorage = {};
   isProcessingQueue = false;
+  isRecoveringCoordinator = false;
   mutationChain = Promise.resolve();
+}
+
+export function setIsProcessingQueueForTesting(val: boolean): void {
+  isProcessingQueue = val;
 }
 
 /**
@@ -278,13 +289,13 @@ export async function scheduleKnowledgeRetryAlarm(): Promise<void> {
     try {
       const existing = await browser.alarms.get(KNOWLEDGE_RETRY_ALARM_NAME);
       if (!existing) {
-        browser.alarms.create(KNOWLEDGE_RETRY_ALARM_NAME, {
+        await browser.alarms.create(KNOWLEDGE_RETRY_ALARM_NAME, {
           delayInMinutes: KNOWLEDGE_RETRY_ALARM_PERIOD_MINUTES,
           periodInMinutes: KNOWLEDGE_RETRY_ALARM_PERIOD_MINUTES,
         });
       }
-    } catch {
-      // Ignored in test/non-extension environments
+    } catch (err) {
+      console.warn('Echo: Failed to schedule knowledge retry alarm:', err);
     }
   }
 }
@@ -614,7 +625,7 @@ export async function syncUntrackedKnowledgeMessages(
 export async function processKnowledgeQueue(
   options: CoordinatorOptions = {}
 ): Promise<ProcessQueueResult> {
-  if (isProcessingQueue) {
+  if (isProcessingQueue || isRecoveringCoordinator) {
     return { status: 'already_running', processedCount: 0 };
   }
 
@@ -631,6 +642,15 @@ export async function processKnowledgeQueue(
   const seenInThisRun = new Set<number>();
 
   try {
+    const initialState = await getCoordinatorState(storage);
+    if (initialState.inFlight) {
+      return {
+        status: 'service_blocked',
+        processedCount: 0,
+        error: 'Interrupted in-flight job pending recovery teardown.',
+      };
+    }
+
     while (true) {
       // 1. Check service availability pre-flight before popping work
       let serviceCheck: OllamaStatus;
@@ -667,6 +687,9 @@ export async function processKnowledgeQueue(
           if (currentQueue.length > 0) {
             await scheduleKnowledgeRetryAlarm();
           }
+          if (options.manageOffscreen !== false) {
+            await closeOffscreenDocument().catch(() => {});
+          }
           return { status: 'service_unknown', processedCount, error: serviceCheck.error };
         }
 
@@ -680,6 +703,9 @@ export async function processKnowledgeQueue(
         if (currentQueue.length > 0) {
           await scheduleKnowledgeRetryAlarm();
         }
+        if (options.manageOffscreen !== false) {
+          await closeOffscreenDocument().catch(() => {});
+        }
         return { status: 'service_offline', processedCount, error: serviceCheck.error };
       }
 
@@ -692,6 +718,9 @@ export async function processKnowledgeQueue(
 
         // Do not create an endless alarm loop for actionable configuration blocks
         await clearKnowledgeRetryAlarm();
+        if (options.manageOffscreen !== false) {
+          await closeOffscreenDocument().catch(() => {});
+        }
         return { status: 'service_blocked', processedCount, error: serviceCheck.error };
       }
 
@@ -702,8 +731,16 @@ export async function processKnowledgeQueue(
         state.lastCheckedAt = new Date().toISOString();
       }, storage);
 
+      if (options.manageOffscreen !== false) {
+        await ensureOffscreenDocument().catch(() => {});
+      }
+
       // 2. Pop next item from pending queue and record in-flight
       const popped = await mutateCoordinatorState((state) => {
+        if (state.inFlight && !seenInThisRun.has(state.inFlight.messageId)) {
+          return null;
+        }
+
         if (state.pendingQueue.length === 0) {
           state.inFlight = null;
           return null;
@@ -747,6 +784,9 @@ export async function processKnowledgeQueue(
           await scheduleKnowledgeRetryAlarm();
         } else {
           await clearKnowledgeRetryAlarm();
+        }
+        if (options.manageOffscreen !== false) {
+          await closeOffscreenDocument().catch(() => {});
         }
         return { status: processedCount > 0 ? 'completed' : 'empty', processedCount };
       }
@@ -825,6 +865,9 @@ export async function processKnowledgeQueue(
           }, storage);
 
           await scheduleKnowledgeRetryAlarm();
+          if (options.manageOffscreen !== false) {
+            await closeOffscreenDocument().catch(() => {});
+          }
           return { status: 'service_unknown', processedCount, error: classification.message };
         }
 
@@ -850,6 +893,9 @@ export async function processKnowledgeQueue(
           }, storage);
 
           await scheduleKnowledgeRetryAlarm();
+          if (options.manageOffscreen !== false) {
+            await closeOffscreenDocument().catch(() => {});
+          }
           return { status: 'service_offline', processedCount, error: classification.message };
         }
 
@@ -875,6 +921,9 @@ export async function processKnowledgeQueue(
           }, storage);
 
           await clearKnowledgeRetryAlarm();
+          if (options.manageOffscreen !== false) {
+            await closeOffscreenDocument().catch(() => {});
+          }
           return { status: 'service_blocked', processedCount, error: classification.message };
         }
 
@@ -916,6 +965,12 @@ export async function processKnowledgeQueue(
     }
   } finally {
     isProcessingQueue = false;
+    if (options.manageOffscreen !== false) {
+      const finalState = await getCoordinatorState(storage);
+      if (!finalState.inFlight && finalState.pendingQueue.length === 0) {
+        await closeOffscreenDocument().catch(() => {});
+      }
+    }
   }
 }
 
@@ -937,14 +992,34 @@ export async function recoverKnowledgeCoordinator(
   const storage = options.storage || getStorage();
   const targetDb = options.targetDb || db;
 
-  if (!targetDb.isOpen()) {
-    await targetDb.open();
+  // Defensive check: if queue is already actively processing in this service-worker instance,
+  // do not perform destructive recovery teardown.
+  if (isProcessingQueue || isRecoveringCoordinator) {
+    return { recovered: false, action: 'idle' };
   }
 
-  return mutateCoordinatorState(async (state) => {
-    if (!state.inFlight) {
-      return { recovered: false, action: 'idle' };
+  isRecoveringCoordinator = true;
+  try {
+    if (!targetDb.isOpen()) {
+      await targetDb.open();
     }
+
+    return await mutateCoordinatorState(async (state) => {
+      // Re-check after async mutex / db open
+      if (isProcessingQueue) {
+        return { recovered: false, action: 'idle' };
+      }
+
+      if (!state.inFlight) {
+        return { recovered: false, action: 'idle' };
+      }
+
+      // Interrupted in-flight job detected.
+      // Teardown any orphaned offscreen document and worker before requeueing.
+      // Do NOT swallow teardown failures: if teardown fails, preserve inFlight and abort recovery.
+      if (options.manageOffscreen !== false) {
+        await closeOffscreenDocument();
+      }
 
     const inFlightId = state.inFlight.messageId;
     const inFlightAttempt = state.inFlight.attempt;
@@ -977,6 +1052,9 @@ export async function recoverKnowledgeCoordinator(
 
     return { recovered: true, action: 'requeued', messageId: inFlightId };
   }, storage);
+  } finally {
+    isRecoveringCoordinator = false;
+  }
 }
 
 /**

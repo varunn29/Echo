@@ -1,3 +1,8 @@
+import {
+  isOffscreenSupportedAndRequired,
+  queryOllamaViaOffscreen,
+} from './offscreenManager';
+
 export interface OllamaModelTag {
   name: string;
   model: string;
@@ -247,9 +252,10 @@ export async function checkOllamaStatus(
 }
 
 /**
- * Sends a structured prompt to Ollama in JSON mode and returns the raw JSON string response.
+ * Executes a direct structured prompt to Ollama in JSON mode and returns the raw JSON string response.
+ * Used directly in non-service-worker environments (e.g. Dedicated Web Worker or Dashboard tab).
  */
-export async function queryOllamaJson(
+export async function executeDirectOllamaJson(
   userPrompt: string,
   options: OllamaClientOptions = {}
 ): Promise<string> {
@@ -349,4 +355,19 @@ export async function queryOllamaJson(
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+/**
+ * Sends a structured prompt to Ollama in JSON mode and returns the raw JSON string response.
+ * In Manifest V3 service worker environments, delegates execution to an offscreen document
+ * with a genuine dedicated Web Worker to prevent premature 30-second fetch watchdog termination.
+ */
+export async function queryOllamaJson(
+  userPrompt: string,
+  options: OllamaClientOptions = {}
+): Promise<string> {
+  if (isOffscreenSupportedAndRequired()) {
+    return queryOllamaViaOffscreen(userPrompt, options);
+  }
+  return executeDirectOllamaJson(userPrompt, options);
 }

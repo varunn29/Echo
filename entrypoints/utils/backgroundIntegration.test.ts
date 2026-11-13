@@ -12,8 +12,12 @@ import {
 import * as databaseModule from './database';
 import * as trainingTrigger from './trainingTrigger';
 import * as knowledgeCoordinator from './knowledgeCoordinator';
+import * as offscreenManager from './offscreenManager';
+import * as knowledgeExtractor from './knowledgeExtractor';
+import * as ollamaClient from './ollamaClient';
 import {
   COORDINATOR_STORAGE_KEY,
+  getCoordinatorState,
   KNOWLEDGE_RETRY_ALARM_NAME,
   type StorageLike,
 } from './knowledgeCoordinator';
@@ -23,6 +27,9 @@ import defaultBackgroundExport, {
   handleRuntimeMessage,
   initializeBackgroundServices,
   resetBackgroundStateForTesting,
+  setIsRecoverySucceededForTesting,
+  getIsRecoverySucceededForTesting,
+  getStartupPromiseForTesting,
   runBackgroundEntrypoint,
   type SaveMessageResponse,
 } from '../background';
@@ -102,6 +109,13 @@ describe('Background Service Worker Integration Suite (Phase 3, Step 3B)', () =>
   });
 
   afterEach(async () => {
+    const pendingStartup = getStartupPromiseForTesting();
+    if (pendingStartup) {
+      await Promise.race([
+        pendingStartup.catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 500)),
+      ]);
+    }
     resetBackgroundStateForTesting();
     knowledgeCoordinator.resetCoordinatorStateForTesting();
     vi.restoreAllMocks();
@@ -462,7 +476,7 @@ describe('Background Service Worker Integration Suite (Phase 3, Step 3B)', () =>
           processedCount: 1,
         });
 
-      handleBackgroundAlarm(
+      await handleBackgroundAlarm(
         { name: KNOWLEDGE_RETRY_ALARM_NAME },
         { storage: testStorage, targetDb: testDb }
       );
@@ -505,6 +519,10 @@ describe('Background Service Worker Integration Suite (Phase 3, Step 3B)', () =>
   });
 
   describe('9. Runtime Message Handling & Validation', () => {
+    beforeEach(() => {
+      setIsRecoverySucceededForTesting(true);
+    });
+
     it('13a. should validate RETRY_FAILED_KNOWLEDGE_MESSAGES payload and reject malformed inputs', async () => {
       let response: any = null;
 
@@ -797,6 +815,10 @@ describe('Background Service Worker Integration Suite (Phase 3, Step 3B)', () =>
   });
 
   describe('10. Concurrency Prevention on Extraction Triggers', () => {
+    beforeEach(() => {
+      setIsRecoverySucceededForTesting(true);
+    });
+
     it('14. should not run concurrent extractions if a trigger arrives while one is already running', async () => {
       // Simulate mutex: second call returns already_running
       let callIndex = 0;
@@ -838,11 +860,571 @@ describe('Background Service Worker Integration Suite (Phase 3, Step 3B)', () =>
   });
 
   describe('11. Service Worker Initialization Hook', () => {
-    it('15. should register alarm and message listeners when runBackgroundEntrypoint runs', () => {
+    it('15. should register alarm and message listeners when runBackgroundEntrypoint runs', async () => {
       runBackgroundEntrypoint();
 
       expect(mockAlarms.onAlarm.addListener).toHaveBeenCalled();
       expect(mockRuntime.onMessage.addListener).toHaveBeenCalled();
+
+      const pending = getStartupPromiseForTesting();
+      if (pending) {
+        await pending.catch(() => {});
+      }
+    });
+  });
+
+  describe('12. Startup Initialization Barrier & Concurrency Safety', () => {
+    it('16. should prevent alarm-triggered queue dispatch while startup recovery is pending', async () => {
+      let resolveRecovery!: (val: any) => void;
+      const recoveryPromise = new Promise((resolve) => {
+        resolveRecovery = resolve;
+      });
+      const recoverySpy = vi
+        .spyOn(knowledgeCoordinator, 'recoverKnowledgeCoordinator')
+        .mockReturnValue(recoveryPromise as any);
+      const processSpy = vi.spyOn(knowledgeCoordinator, 'processKnowledgeQueue').mockResolvedValue({
+        status: 'completed',
+        processedCount: 0,
+      });
+
+      // 1. Start background services initialization (recovery remains pending)
+      initializeBackgroundServices({ storage: testStorage, targetDb: testDb });
+      expect(recoverySpy).toHaveBeenCalled();
+
+      // 2. Alarm fires while startup recovery is still in flight
+      const alarmPromise = handleBackgroundAlarm(
+        { name: KNOWLEDGE_RETRY_ALARM_NAME },
+        { storage: testStorage, targetDb: testDb }
+      );
+
+      // Give event loop time to advance microtasks
+      await new Promise((r) => setTimeout(r, 25));
+
+      // processKnowledgeQueue must NOT be called while recovery is pending
+      expect(processSpy).not.toHaveBeenCalled();
+
+      // 3. Resolve recovery
+      resolveRecovery({ recovered: false, action: 'idle' });
+      await alarmPromise;
+
+      // processKnowledgeQueue is now dispatched safely
+      expect(processSpy).toHaveBeenCalled();
+    });
+
+    it('17. should prevent runtime-message-triggered queue dispatch while startup recovery is pending', async () => {
+      let resolveRecovery!: (val: any) => void;
+      const recoveryPromise = new Promise((resolve) => {
+        resolveRecovery = resolve;
+      });
+      vi.spyOn(knowledgeCoordinator, 'recoverKnowledgeCoordinator').mockReturnValue(recoveryPromise as any);
+      const processSpy = vi.spyOn(knowledgeCoordinator, 'processKnowledgeQueue').mockResolvedValue({
+        status: 'completed',
+        processedCount: 0,
+      });
+
+      // 1. Start background services initialization
+      initializeBackgroundServices({ storage: testStorage, targetDb: testDb });
+
+      // 2. Dashboard requests START_KNOWLEDGE_EXTRACTION while recovery is pending
+      let response: any = null;
+      handleRuntimeMessage(
+        { type: 'START_KNOWLEDGE_EXTRACTION' },
+        {},
+        (res) => {
+          response = res;
+        },
+        { storage: testStorage, targetDb: testDb }
+      );
+
+      await new Promise((r) => setTimeout(r, 25));
+      expect(processSpy).not.toHaveBeenCalled();
+      expect(response).toBeNull();
+
+      // 3. Complete recovery
+      resolveRecovery({ recovered: false, action: 'idle' });
+      await new Promise((r) => setTimeout(r, 40));
+
+      expect(processSpy).toHaveBeenCalled();
+      expect(response).toEqual({
+        success: true,
+        result: { status: 'completed', processedCount: 0 },
+      });
+    });
+
+    it('18. should ensure recovery completes before NEW_USER_MESSAGE triggers queue dispatch', async () => {
+      const executionOrder: string[] = [];
+
+      vi.spyOn(knowledgeCoordinator, 'recoverKnowledgeCoordinator').mockImplementation(async () => {
+        await new Promise((r) => setTimeout(r, 20));
+        executionOrder.push('startup_recovery');
+        return { recovered: false, action: 'idle' };
+      });
+
+      vi.spyOn(knowledgeCoordinator, 'processKnowledgeQueue').mockImplementation(async () => {
+        executionOrder.push('queue_dispatch');
+        return { status: 'completed', processedCount: 0 };
+      });
+
+      // Start initialization and receive new message concurrently
+      initializeBackgroundServices({ storage: testStorage, targetDb: testDb });
+
+      let captured = false;
+      handleRuntimeMessage(
+        {
+          type: 'NEW_USER_MESSAGE',
+          text: 'Message checking barrier execution ordering',
+        },
+        {},
+        (res) => {
+          captured = res?.success;
+        },
+        { storage: testStorage, targetDb: testDb }
+      );
+
+      await new Promise((r) => setTimeout(r, 60));
+
+      expect(captured).toBe(true);
+      expect(executionOrder.length).toBeGreaterThanOrEqual(1);
+      // Startup recovery must precede any queue dispatch
+      expect(executionOrder[0]).toBe('startup_recovery');
+      expect(executionOrder).toContain('queue_dispatch');
+    });
+
+    it('19. should ensure multiple concurrent events waiting for startup initialization do not cause duplicate initialization', async () => {
+      let recoveryCalls = 0;
+      vi.spyOn(knowledgeCoordinator, 'recoverKnowledgeCoordinator').mockImplementation(async () => {
+        recoveryCalls++;
+        await new Promise((r) => setTimeout(r, 25));
+        return { recovered: false, action: 'idle' };
+      });
+
+      vi.spyOn(knowledgeCoordinator, 'processKnowledgeQueue').mockResolvedValue({
+        status: 'completed',
+        processedCount: 0,
+      });
+
+      // Kick off background startup
+      initializeBackgroundServices({ storage: testStorage, targetDb: testDb });
+
+      // Concurrently fire alarm and runtime messages
+      await Promise.all([
+        handleBackgroundAlarm(
+          { name: KNOWLEDGE_RETRY_ALARM_NAME },
+          { storage: testStorage, targetDb: testDb }
+        ),
+        new Promise((resolve) => {
+          handleRuntimeMessage(
+            { type: 'START_KNOWLEDGE_EXTRACTION' },
+            {},
+            resolve,
+            { storage: testStorage, targetDb: testDb }
+          );
+        }),
+        new Promise((resolve) => {
+          handleRuntimeMessage(
+            { type: 'NEW_USER_MESSAGE', text: 'Concurrent event test' },
+            {},
+            resolve,
+            { storage: testStorage, targetDb: testDb }
+          );
+        }),
+      ]);
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Recovery must only execute once across all events
+      expect(recoveryCalls).toBe(1);
+    });
+
+    it('20. should ensure recovery failure leaves recovery incomplete, clears startupPromise, and schedules retry alarm', async () => {
+      const alarmSpy = vi.spyOn(mockAlarms, 'create');
+      vi.spyOn(knowledgeCoordinator, 'recoverKnowledgeCoordinator').mockRejectedValue(
+        new Error('Database locked during startup')
+      );
+
+      // Attempt startup initialization
+      await expect(
+        initializeBackgroundServices({ storage: testStorage, targetDb: testDb })
+      ).rejects.toThrow('Database locked during startup');
+
+      // Assertions
+      expect(getIsRecoverySucceededForTesting()).toBe(false);
+      expect(getStartupPromiseForTesting()).toBeNull();
+      expect(alarmSpy).toHaveBeenCalledWith(
+        KNOWLEDGE_RETRY_ALARM_NAME,
+        expect.objectContaining({ periodInMinutes: 1 })
+      );
+    });
+
+    it('21. should retry recovery on subsequent alarm without service worker restart after initial recovery failure', async () => {
+      let recoveryAttempts = 0;
+      vi.spyOn(knowledgeCoordinator, 'recoverKnowledgeCoordinator').mockImplementation(async () => {
+        recoveryAttempts++;
+        if (recoveryAttempts === 1) {
+          throw new Error('Initial transient failure');
+        }
+        return { recovered: false, action: 'idle' };
+      });
+      const processSpy = vi.spyOn(knowledgeCoordinator, 'processKnowledgeQueue').mockResolvedValue({
+        status: 'completed',
+        processedCount: 0,
+      });
+
+      // 1. Initial startup fails
+      await expect(
+        initializeBackgroundServices({ storage: testStorage, targetDb: testDb })
+      ).rejects.toThrow('Initial transient failure');
+      expect(recoveryAttempts).toBe(1);
+      expect(getIsRecoverySucceededForTesting()).toBe(false);
+
+      // 2. Alarm fires without service worker restarting
+      await handleBackgroundAlarm(
+        { name: KNOWLEDGE_RETRY_ALARM_NAME },
+        { storage: testStorage, targetDb: testDb }
+      );
+
+      // Assertions: recovery retried and succeeded
+      expect(recoveryAttempts).toBe(2);
+      expect(getIsRecoverySucceededForTesting()).toBe(true);
+      expect(processSpy).toHaveBeenCalled();
+    });
+
+    it('22. should ensure multiple concurrent events during recovery retry share the same recovery attempt', async () => {
+      // Start in unrecovered state
+      setIsRecoverySucceededForTesting(false);
+
+      let recoveryCalls = 0;
+      vi.spyOn(knowledgeCoordinator, 'recoverKnowledgeCoordinator').mockImplementation(async () => {
+        recoveryCalls++;
+        await new Promise((r) => setTimeout(r, 25));
+        return { recovered: false, action: 'idle' };
+      });
+      vi.spyOn(knowledgeCoordinator, 'processKnowledgeQueue').mockResolvedValue({
+        status: 'completed',
+        processedCount: 0,
+      });
+
+      // Two concurrent events trigger retry
+      await Promise.all([
+        handleBackgroundAlarm(
+          { name: KNOWLEDGE_RETRY_ALARM_NAME },
+          { storage: testStorage, targetDb: testDb }
+        ),
+        new Promise((resolve) => {
+          handleRuntimeMessage(
+            { type: 'START_KNOWLEDGE_EXTRACTION' },
+            {},
+            resolve,
+            { storage: testStorage, targetDb: testDb }
+          );
+        }),
+      ]);
+
+      // Exactly 1 recovery attempt across both concurrent events
+      expect(recoveryCalls).toBe(1);
+      expect(getIsRecoverySucceededForTesting()).toBe(true);
+    });
+
+    it('23. should ensure events arriving during startup queue draining wait until the startup promise settles', async () => {
+      vi.spyOn(knowledgeCoordinator, 'recoverKnowledgeCoordinator').mockResolvedValue({
+        recovered: false,
+        action: 'idle',
+      });
+
+      let resolveStartupQueue!: () => void;
+      const startupQueuePromise = new Promise<void>((resolve) => {
+        resolveStartupQueue = resolve;
+      });
+
+      let queueCalls = 0;
+      vi.spyOn(knowledgeCoordinator, 'processKnowledgeQueue').mockImplementation(async () => {
+        queueCalls++;
+        if (queueCalls === 1) {
+          // Startup queue draining is in progress
+          await startupQueuePromise;
+          return { status: 'completed', processedCount: 0 };
+        }
+        return { status: 'completed', processedCount: 1 };
+      });
+
+      try {
+        // 1. Kick off startup
+        const initPromise = initializeBackgroundServices({ storage: testStorage, targetDb: testDb });
+
+        // Give microtasks time to complete recovery and enter processKnowledgeQueue
+        await new Promise((r) => setTimeout(r, 15));
+        expect(getIsRecoverySucceededForTesting()).toBe(true);
+        expect(queueCalls).toBe(1); // Startup queue call in flight
+
+        // 2. Alarm fires while startup queue draining is still in progress
+        let alarmFinished = false;
+        const alarmPromise = handleBackgroundAlarm(
+          { name: KNOWLEDGE_RETRY_ALARM_NAME },
+          { storage: testStorage, targetDb: testDb }
+        )?.then(() => {
+          alarmFinished = true;
+        });
+
+        await new Promise((r) => setTimeout(r, 20));
+        // Alarm must be waiting for startup queue processing to settle
+        expect(queueCalls).toBe(1);
+        expect(alarmFinished).toBe(false);
+
+        // 3. Startup queue settles
+        resolveStartupQueue();
+        await initPromise;
+        await alarmPromise;
+
+        // Alarm dispatches safely after startup promise settled
+        expect(queueCalls).toBe(2);
+        expect(alarmFinished).toBe(true);
+      } finally {
+        resolveStartupQueue();
+      }
+    });
+
+    it('24. should process a NEW_USER_MESSAGE enqueued during startup queue completion after startup promise settles', async () => {
+      vi.spyOn(knowledgeCoordinator, 'recoverKnowledgeCoordinator').mockResolvedValue({
+        recovered: false,
+        action: 'idle',
+      });
+
+      vi.spyOn(ollamaClient, 'checkOllamaStatus').mockResolvedValue({
+        isRunning: true,
+        isModelReady: true,
+        modelName: 'llama3:latest',
+      });
+
+      vi.spyOn(offscreenManager, 'ensureOffscreenDocument').mockResolvedValue();
+
+      let resolveTeardown!: () => void;
+      const teardownGate = new Promise<void>((resolve) => {
+        resolveTeardown = resolve;
+      });
+
+      let closeCalls = 0;
+      vi.spyOn(offscreenManager, 'closeOffscreenDocument').mockImplementation(async () => {
+        closeCalls++;
+        if (closeCalls === 1) {
+          // Gate the startup queue's completion teardown
+          await teardownGate;
+        }
+      });
+
+      let savedMessageId: number | null = null;
+      let resolveExtraction!: (id: number) => void;
+      let rejectExtraction!: (err: unknown) => void;
+      const extractionDone = new Promise<number>((resolve, reject) => {
+        resolveExtraction = resolve;
+        rejectExtraction = reject;
+      });
+
+      const processedMessageIds: number[] = [];
+      vi.spyOn(knowledgeExtractor, 'extractKnowledgeFromMessage').mockImplementation(async (msg) => {
+        try {
+          if (msg.id) {
+            processedMessageIds.push(msg.id);
+            if (savedMessageId !== null && msg.id === savedMessageId) {
+              resolveExtraction(msg.id);
+            }
+          }
+          return {
+            messageId: msg.id!,
+            outcome: 'extracted',
+            extractedCount: 1,
+            duplicateCount: 0,
+          };
+        } catch (err) {
+          rejectExtraction(err);
+          throw err;
+        }
+      });
+
+      const originalEnqueue = knowledgeCoordinator.enqueueKnowledgeMessage;
+      let resolveEnqueue!: () => void;
+      let rejectEnqueue!: (err: unknown) => void;
+      const enqueueDone = new Promise<void>((resolve, reject) => {
+        resolveEnqueue = resolve;
+        rejectEnqueue = reject;
+      });
+      vi.spyOn(knowledgeCoordinator, 'enqueueKnowledgeMessage').mockImplementation(async (...args) => {
+        try {
+          const res = await originalEnqueue(...args);
+          resolveEnqueue();
+          return res;
+        } catch (err) {
+          rejectEnqueue(err);
+          throw err;
+        }
+      });
+
+      try {
+        // 1. Start background initialization
+        const initPromise = initializeBackgroundServices({ storage: testStorage, targetDb: testDb });
+
+        // Wait until startup queue starts and blocks inside closeOffscreenDocument teardown
+        await new Promise((r) => setTimeout(r, 15));
+        expect(closeCalls).toBe(1);
+        expect(getIsRecoverySucceededForTesting()).toBe(true);
+
+        // 2. While startup teardown is in flight, a NEW_USER_MESSAGE arrives
+        handleRuntimeMessage(
+          {
+            type: 'NEW_USER_MESSAGE',
+            text: 'I have been reflecting deeply on our product strategy and architecture over the past several months, and I realize we need a more decoupled approach for long-term scalability and reliability.',
+          },
+          {},
+          (response: any) => {
+            savedMessageId = response?.id;
+          },
+          { storage: testStorage, targetDb: testDb }
+        );
+
+        // Wait for enqueue operation to complete with a bounded timeout
+        let enqueueTimer!: ReturnType<typeof setTimeout>;
+        const enqueueTimeout = new Promise<never>((_, reject) => {
+          enqueueTimer = setTimeout(() => {
+            reject(new Error('Timed out waiting for message to be enqueued in coordinator'));
+          }, 2000);
+        });
+        try {
+          await Promise.race([enqueueDone, enqueueTimeout]);
+        } finally {
+          clearTimeout(enqueueTimer);
+        }
+
+        expect(savedMessageId).not.toBeNull();
+        expect(typeof savedMessageId).toBe('number');
+        expect(savedMessageId!).toBeGreaterThan(0);
+
+        // Read actual coordinator state from test storage and assert newly persisted message exists in pendingQueue
+        const stateDuringTeardown = await getCoordinatorState(testStorage);
+        expect(
+          stateDuringTeardown.pendingQueue.some((item) => item.messageId === savedMessageId)
+        ).toBe(true);
+
+        // While teardown is still blocked, no extraction processing should have run yet
+        expect(processedMessageIds).toHaveLength(0);
+
+        // 3. Unblock startup queue teardown so startup promise settles
+        resolveTeardown();
+        await initPromise;
+
+        // 4. Await extraction completion for the expected message ID with a reasonable timeout
+        let extractionTimer!: ReturnType<typeof setTimeout>;
+        const extractionTimeout = new Promise<never>((_, reject) => {
+          extractionTimer = setTimeout(() => {
+            reject(new Error(`Timed out waiting for message ${savedMessageId} to be extracted`));
+          }, 2000);
+        });
+        try {
+          await Promise.race([extractionDone, extractionTimeout]);
+        } finally {
+          clearTimeout(extractionTimer);
+        }
+
+        // Verify that the subsequent queue dispatch processed that actual message ID (not hardcoded)
+        expect(processedMessageIds).toEqual([savedMessageId]);
+
+        // Verify coordinator state in storage reflects successful extraction
+        let finalState = await getCoordinatorState(testStorage);
+        if (finalState.registry[savedMessageId!]?.status !== 'extracted') {
+          for (let i = 0; i < 20 && finalState.registry[savedMessageId!]?.status !== 'extracted'; i++) {
+            await new Promise((r) => setTimeout(r, 5));
+            finalState = await getCoordinatorState(testStorage);
+          }
+        }
+        expect(finalState.pendingQueue).toHaveLength(0);
+        expect(finalState.registry[savedMessageId!]?.status).toBe('extracted');
+      } finally {
+        resolveTeardown();
+      }
+    });
+
+    it('25. should not trigger another recovery attempt on subsequent event if queue processing failed after recovery', async () => {
+      let recoveryCount = 0;
+      vi.spyOn(knowledgeCoordinator, 'recoverKnowledgeCoordinator').mockImplementation(async () => {
+        recoveryCount++;
+        return { recovered: false, action: 'idle' };
+      });
+
+      // Initial queue processing fails (e.g. Ollama service offline)
+      let queueRun = 0;
+      vi.spyOn(knowledgeCoordinator, 'processKnowledgeQueue').mockImplementation(async () => {
+        queueRun++;
+        if (queueRun === 1) {
+          throw new Error('Ollama service connection refused');
+        }
+        return { status: 'completed', processedCount: 0 };
+      });
+
+      // 1. Startup initialization completes recovery, queue fails
+      await initializeBackgroundServices({ storage: testStorage, targetDb: testDb });
+
+      expect(recoveryCount).toBe(1);
+      expect(getIsRecoverySucceededForTesting()).toBe(true);
+      expect(getStartupPromiseForTesting()).toBeNull();
+
+      // 2. Subsequent alarm fires
+      await handleBackgroundAlarm(
+        { name: KNOWLEDGE_RETRY_ALARM_NAME },
+        { storage: testStorage, targetDb: testDb }
+      );
+
+      // Recovery was NOT called again; queue was dispatched directly
+      expect(recoveryCount).toBe(1);
+      expect(queueRun).toBe(2);
+    });
+
+    it('26. should preserve inFlight state in storage and schedule retry if offscreen teardown fails during recovery', async () => {
+      const alarmSpy = vi.spyOn(mockAlarms, 'create');
+      vi.spyOn(offscreenManager, 'closeOffscreenDocument').mockRejectedValue(
+        new Error('Offscreen renderer unresponsive')
+      );
+
+      const msgId = 999;
+      const initialInFlight = {
+        messageId: msgId,
+        startedAt: '2026-11-12T10:00:00.000Z',
+        attempt: 1,
+      };
+
+      await testStorage.set({
+        [COORDINATOR_STORAGE_KEY]: {
+          version: 1,
+          pendingQueue: [],
+          inFlight: initialInFlight,
+          registry: {
+            [msgId]: {
+              messageId: msgId,
+              status: 'pending',
+              attempts: 1,
+              enqueuedAt: '2026-11-12T10:00:00.000Z',
+              updatedAt: '2026-11-12T10:00:00.000Z',
+            },
+          },
+          serviceStatus: 'online',
+        },
+      });
+
+      // Initialize background services (recovery should fail because closeOffscreenDocument throws)
+      await expect(
+        initializeBackgroundServices({ storage: testStorage, targetDb: testDb })
+      ).rejects.toThrow('Offscreen renderer unresponsive');
+
+      // Verify inFlight is STILL present in storage
+      const storageState = (await testStorage.get(COORDINATOR_STORAGE_KEY)) as any;
+      const state = storageState[COORDINATOR_STORAGE_KEY];
+      expect(state.inFlight).toEqual(initialInFlight);
+      expect(state.pendingQueue).toHaveLength(0);
+
+      // Verify recovery is not marked succeeded and retry alarm was scheduled
+      expect(getIsRecoverySucceededForTesting()).toBe(false);
+      expect(getStartupPromiseForTesting()).toBeNull();
+      expect(alarmSpy).toHaveBeenCalledWith(
+        KNOWLEDGE_RETRY_ALARM_NAME,
+        expect.objectContaining({ periodInMinutes: 1 })
+      );
     });
   });
 });

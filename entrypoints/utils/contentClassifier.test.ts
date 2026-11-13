@@ -536,5 +536,57 @@ How can I persist the timer reference across re-renders without triggering extra
       expect(result.wordCount).toBe(0);
     });
   });
+
+  describe('12. Personal Opinion and Values ("I value")', function () {
+    it('1. should classify "I value software that behaves consistently..." as prose with possible knowledge signal', function () {
+      const text =
+        'I value software that behaves consistently and handles unexpected situations gracefully.';
+      const result = classifyContent(text);
+      expect(result.contentType).toBe('prose');
+      expect(result.styleSignal).toBe('strong');
+      expect(result.knowledgeSignal).toBe('possible');
+      expect(result.reasons).toContain('personal_context_detected');
+    });
+
+    it('2. should classify the original skipped message as eligible prose with possible knowledge signal', function () {
+      const text =
+        'I value software that behaves consistently and handles unexpected situations gracefully. A reliable application should not lose user data just because an external service is temporarily unavailable.';
+      const result = classifyContent(text);
+      expect(result.contentType).toBe('prose');
+      expect(result.styleSignal).toBe('strong');
+      expect(result.knowledgeSignal).toBe('possible');
+      expect(result.reasons).toContain('personal_context_detected');
+
+      const isEligible =
+        (result.contentType === 'prose' || result.contentType === 'mixed') &&
+        result.knowledgeSignal === 'possible';
+      expect(isEligible).toBe(true);
+    });
+
+    it('3. should not reject message containing an "I value" opinion combined with a procedural question', function () {
+      const text =
+        'I value software that behaves consistently and handles unexpected situations gracefully, so when are we going to deploy the new error boundary?';
+      const result = classifyContent(text);
+      expect(result.contentType).toBe('prose');
+      expect(result.knowledgeSignal).toBe('possible');
+      expect(result.reasons).toContain('personal_context_detected');
+    });
+
+    it('4. should not independently trigger personal knowledge on bare "I believe"', function () {
+      const text = 'I believe this function has an off-by-one error on line 42.';
+      const result = classifyContent(text);
+      expect(result.contentType).toBe('prose');
+      expect(result.knowledgeSignal).toBe('none');
+      expect(result.reasons).not.toContain('personal_context_detected');
+    });
+
+    it('5. should not independently trigger personal knowledge on bare "I appreciate your help"', function () {
+      const text = 'I appreciate your help with debugging this issue.';
+      const result = classifyContent(text);
+      expect(result.contentType).toBe('prose');
+      expect(result.knowledgeSignal).toBe('none');
+      expect(result.reasons).not.toContain('personal_context_detected');
+    });
+  });
 });
 

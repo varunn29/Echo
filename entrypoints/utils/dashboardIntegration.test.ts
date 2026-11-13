@@ -243,6 +243,11 @@ describe('Dashboard Integration Suite (Phase 3, Step 4)', () => {
     });
 
     it('should handle RETRY_FAILED_KNOWLEDGE_MESSAGES and requeue permanently failed items', async () => {
+      vi.spyOn(knowledgeCoordinator, 'processKnowledgeQueue').mockResolvedValue({
+        status: 'completed',
+        processedCount: 0,
+      });
+
       // Seed a failed_permanent entry in coordinator storage
       await testStorage.set({
         [COORDINATOR_STORAGE_KEY]: {
@@ -286,6 +291,11 @@ describe('Dashboard Integration Suite (Phase 3, Step 4)', () => {
     });
 
     it('should handle RECONSIDER_SKIPPED_KNOWLEDGE_MESSAGES and re-evaluate eligibility', async () => {
+      vi.spyOn(knowledgeCoordinator, 'processKnowledgeQueue').mockResolvedValue({
+        status: 'completed',
+        processedCount: 0,
+      });
+
       const msgId = (await saveWritingMessage(
         {
           platform: 'ChatGPT',

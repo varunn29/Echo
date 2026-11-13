@@ -577,7 +577,7 @@ function WritingData() {
                   {coordinatorStatus.skippedCount > 0 && (
                     <div className="flex items-center gap-2">
                       <span className="text-xs text-[#68766d]">
-                        {coordinatorStatus.skippedCount} non-prose / code message(s) skipped:
+                        {coordinatorStatus.skippedCount} message(s) skipped by the content eligibility filter:
                       </span>
                       <button
                         type="button"

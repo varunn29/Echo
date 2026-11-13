@@ -26,12 +26,14 @@ import {
   retryFailedKnowledgeMessages,
   sanitizeErrorMessage,
   scheduleKnowledgeRetryAlarm,
+  setIsProcessingQueueForTesting,
   syncUntrackedKnowledgeMessages,
   type KnowledgeCoordinatorState,
   type StorageLike,
 } from './knowledgeCoordinator';
 import * as knowledgeExtractor from './knowledgeExtractor';
 import * as ollamaClient from './ollamaClient';
+import * as offscreenManager from './offscreenManager';
 
 function createUniqueDbName(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
@@ -676,6 +678,348 @@ describe('Knowledge Coordinator Suite', function () {
       expect(state.registry[msgId]?.enqueuedAt).toBe('2026-11-12T00:00:00.000Z');
       expect(state.registry[msgId]?.status).not.toBe('extracted');
     });
+
+    it('should ensure successful offscreen teardown happens before requeueing', async function () {
+      let closeCalledBeforeRequeue = false;
+      const closeSpy = vi.spyOn(offscreenManager, 'closeOffscreenDocument').mockImplementation(async () => {
+        const interimState = await getCoordinatorState(testStorage);
+        // At the moment teardown executes, inFlight must still be present and pendingQueue must be empty
+        closeCalledBeforeRequeue = Boolean(interimState.inFlight && interimState.pendingQueue.length === 0);
+      });
+
+      const testDb = trackDb(createEchoDatabase(createUniqueDbName('RecoveryOrder')));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'Message checking recovery teardown ordering',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      await testStorage.set({
+        [COORDINATOR_STORAGE_KEY]: {
+          version: 1,
+          pendingQueue: [],
+          inFlight: {
+            messageId: msgId,
+            startedAt: new Date().toISOString(),
+            attempt: 1,
+          },
+          registry: {
+            [msgId]: {
+              messageId: msgId,
+              status: 'pending',
+              attempts: 1,
+              enqueuedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+          },
+          serviceStatus: 'online',
+        },
+      });
+
+      const recovery = await recoverKnowledgeCoordinator({
+        storage: testStorage,
+        targetDb: testDb,
+      });
+
+      expect(closeSpy).toHaveBeenCalled();
+      expect(closeCalledBeforeRequeue).toBe(true);
+      expect(recovery.recovered).toBe(true);
+      expect(recovery.action).toBe('requeued');
+
+      const finalState = await getCoordinatorState(testStorage);
+      expect(finalState.inFlight).toBeNull();
+      expect(finalState.pendingQueue).toHaveLength(1);
+    });
+
+    it('should preserve in-flight job and prevent immediate redispatch if offscreen close fails', async function () {
+      vi.spyOn(offscreenManager, 'closeOffscreenDocument').mockRejectedValue(
+        new Error('Offscreen teardown failed: renderer unresponsive')
+      );
+
+      const testDb = trackDb(createEchoDatabase(createUniqueDbName('RecoveryFailure')));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'Message where teardown fails',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      const fixedStartedAt = '2026-11-12T10:00:00.000Z';
+      await testStorage.set({
+        [COORDINATOR_STORAGE_KEY]: {
+          version: 1,
+          pendingQueue: [],
+          inFlight: {
+            messageId: msgId,
+            startedAt: fixedStartedAt,
+            attempt: 2,
+          },
+          registry: {
+            [msgId]: {
+              messageId: msgId,
+              status: 'pending',
+              attempts: 2,
+              enqueuedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+          },
+          serviceStatus: 'online',
+        },
+      });
+
+      // 1. Recovery must not swallow teardown failure
+      await expect(
+        recoverKnowledgeCoordinator({
+          storage: testStorage,
+          targetDb: testDb,
+        })
+      ).rejects.toThrow('Offscreen teardown failed: renderer unresponsive');
+
+      // 2. inFlight must be preserved in storage without clearing or requeueing
+      const stateAfterFail = await getCoordinatorState(testStorage);
+      expect(stateAfterFail.inFlight).toEqual({
+        messageId: msgId,
+        startedAt: fixedStartedAt,
+        attempt: 2,
+      });
+      expect(stateAfterFail.pendingQueue).toHaveLength(0);
+
+      // 3. Queue processing must not immediately redispatch while inFlight is unrecovered
+      const procResult = await processKnowledgeQueue({
+        storage: testStorage,
+        targetDb: testDb,
+      });
+      expect(procResult.status).toBe('service_blocked');
+      expect(procResult.processedCount).toBe(0);
+
+      const stateAfterBlockedQueue = await getCoordinatorState(testStorage);
+      expect(stateAfterBlockedQueue.inFlight?.messageId).toBe(msgId);
+    });
+
+    it('should allow a later recovery attempt to recover the preserved in-flight job once teardown succeeds', async function () {
+      const closeSpy = vi.spyOn(offscreenManager, 'closeOffscreenDocument');
+
+      // First attempt fails
+      closeSpy.mockRejectedValueOnce(new Error('Transient close timeout'));
+
+      const testDb = trackDb(createEchoDatabase(createUniqueDbName('RecoveryRetry')));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'Message needing secondary recovery attempt',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      await testStorage.set({
+        [COORDINATOR_STORAGE_KEY]: {
+          version: 1,
+          pendingQueue: [],
+          inFlight: {
+            messageId: msgId,
+            startedAt: new Date().toISOString(),
+            attempt: 1,
+          },
+          registry: {
+            [msgId]: {
+              messageId: msgId,
+              status: 'pending',
+              attempts: 1,
+              enqueuedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+          },
+          serviceStatus: 'online',
+        },
+      });
+
+      // Attempt 1: fails
+      await expect(
+        recoverKnowledgeCoordinator({
+          storage: testStorage,
+          targetDb: testDb,
+        })
+      ).rejects.toThrow('Transient close timeout');
+
+      // Attempt 2: teardown now succeeds
+      closeSpy.mockResolvedValueOnce();
+      const secondRecovery = await recoverKnowledgeCoordinator({
+        storage: testStorage,
+        targetDb: testDb,
+      });
+
+      expect(secondRecovery.recovered).toBe(true);
+      expect(secondRecovery.action).toBe('requeued');
+      expect(secondRecovery.messageId).toBe(msgId);
+
+      const state = await getCoordinatorState(testStorage);
+      expect(state.inFlight).toBeNull();
+      expect(state.pendingQueue).toHaveLength(1);
+      expect(state.pendingQueue[0]?.messageId).toBe(msgId);
+    });
+
+    it('should prevent concurrent recovery calls from recovering or requeueing the same job twice', async function () {
+      const closeSpy = vi.spyOn(offscreenManager, 'closeOffscreenDocument').mockResolvedValue();
+
+      const testDb = trackDb(createEchoDatabase(createUniqueDbName('ConcurrentRecovery')));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'Concurrent recovery race test',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      await testStorage.set({
+        [COORDINATOR_STORAGE_KEY]: {
+          version: 1,
+          pendingQueue: [],
+          inFlight: {
+            messageId: msgId,
+            startedAt: new Date().toISOString(),
+            attempt: 1,
+          },
+          registry: {
+            [msgId]: {
+              messageId: msgId,
+              status: 'pending',
+              attempts: 1,
+              enqueuedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+          },
+          serviceStatus: 'online',
+        },
+      });
+
+      const [res1, res2] = await Promise.all([
+        recoverKnowledgeCoordinator({ storage: testStorage, targetDb: testDb }),
+        recoverKnowledgeCoordinator({ storage: testStorage, targetDb: testDb }),
+      ]);
+
+      const results = [res1, res2];
+      const requeuedCount = results.filter((r) => r.recovered && r.action === 'requeued').length;
+      const idleCount = results.filter((r) => !r.recovered && r.action === 'idle').length;
+
+      expect(requeuedCount).toBe(1);
+      expect(idleCount).toBe(1);
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+
+      const state = await getCoordinatorState(testStorage);
+      expect(state.inFlight).toBeNull();
+      expect(state.pendingQueue).toHaveLength(1);
+    });
+
+    it('should not perform offscreen teardown when coordinator is idle without inFlight job', async function () {
+      const closeSpy = vi.spyOn(offscreenManager, 'closeOffscreenDocument').mockResolvedValue();
+
+      await testStorage.set({
+        [COORDINATOR_STORAGE_KEY]: {
+          version: 1,
+          pendingQueue: [],
+          inFlight: null,
+          registry: {},
+          serviceStatus: 'online',
+        },
+      });
+
+      const recovery = await recoverKnowledgeCoordinator({
+        storage: testStorage,
+      });
+
+      expect(recovery.recovered).toBe(false);
+      expect(recovery.action).toBe('idle');
+      expect(closeSpy).not.toHaveBeenCalled();
+    });
+
+    it('should defensively return idle and skip offscreen teardown if queue processing is active', async function () {
+      const closeSpy = vi.spyOn(offscreenManager, 'closeOffscreenDocument').mockResolvedValue();
+
+      const testDb = trackDb(createEchoDatabase(createUniqueDbName('ActiveQueueDefensive')));
+      await testDb.open();
+
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'Message being actively processed',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      await testStorage.set({
+        [COORDINATOR_STORAGE_KEY]: {
+          version: 1,
+          pendingQueue: [],
+          inFlight: {
+            messageId: msgId,
+            startedAt: new Date().toISOString(),
+            attempt: 1,
+          },
+          registry: {
+            [msgId]: {
+              messageId: msgId,
+              status: 'pending',
+              attempts: 1,
+              enqueuedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+          },
+          serviceStatus: 'online',
+        },
+      });
+
+      try {
+        setIsProcessingQueueForTesting(true);
+
+        const recovery = await recoverKnowledgeCoordinator({
+          storage: testStorage,
+          targetDb: testDb,
+        });
+
+        expect(recovery.recovered).toBe(false);
+        expect(recovery.action).toBe('idle');
+        expect(closeSpy).not.toHaveBeenCalled();
+
+        // inFlight job must be untouched
+        const state = await getCoordinatorState(testStorage);
+        expect(state.inFlight).not.toBeNull();
+        expect(state.inFlight?.messageId).toBe(msgId);
+        expect(state.pendingQueue).toHaveLength(0);
+      } finally {
+        setIsProcessingQueueForTesting(false);
+      }
+    });
   });
 
   describe('8. Manual Recovery Operations', function () {
@@ -825,6 +1169,47 @@ describe('Knowledge Coordinator Suite', function () {
 
       await clearKnowledgeRetryAlarm();
       expect(mockAlarms.clear).toHaveBeenCalledWith(KNOWLEDGE_RETRY_ALARM_NAME);
+    });
+
+    it('should log a warning if reading existing retry alarm fails', async function () {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const error = new Error('Alarm read error');
+      mockAlarms.get.mockRejectedValueOnce(error);
+
+      await scheduleKnowledgeRetryAlarm();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        'Echo: Failed to schedule knowledge retry alarm:',
+        error
+      );
+    });
+
+    it('should log a warning if creating retry alarm fails', async function () {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const error = new Error('Alarm creation error');
+      mockAlarms.create.mockImplementationOnce(() => {
+        throw error;
+      });
+
+      await scheduleKnowledgeRetryAlarm();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        'Echo: Failed to schedule knowledge retry alarm:',
+        error
+      );
+    });
+
+    it('should log a warning if creating retry alarm rejects asynchronously', async function () {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const error = new Error('Async alarm creation rejected');
+      mockAlarms.create.mockRejectedValueOnce(error);
+
+      await scheduleKnowledgeRetryAlarm();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        'Echo: Failed to schedule knowledge retry alarm:',
+        error
+      );
     });
   });
 

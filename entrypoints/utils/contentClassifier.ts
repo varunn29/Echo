@@ -208,7 +208,7 @@ const PERSONAL_EXPERIENCE_PATTERNS = [
   /\b(I\s+learn\s+best\s+by|I\s+prefer\s+learning|the\s+way\s+I\s+understand|helps\s+me\s+understand|helps\s+me\s+visualize)\b/i,
 
   // 5. Personal opinions and behavioral tendencies
-  /\b(frustrates\s+me|I\s+just\s+hate|I\s+hate|I\s+really\s+like|I\s+love|I\s+prefer|in\s+my\s+opinion|from\s+my\s+experience|I\s+strongly\s+believe|my\s+take\s+on\s+this\s+is)\b/i,
+  /\b(frustrates\s+me|I\s+just\s+hate|I\s+hate|I\s+really\s+like|I\s+love|I\s+prefer|I\s+value|in\s+my\s+opinion|from\s+my\s+experience|I\s+strongly\s+believe|my\s+take\s+on\s+this\s+is)\b/i,
   /\b(if\s+I\s+have\s+enough\s+knowledge|if\s+I\s+know\s+enough|when\s+I\s+disagree|in\s+disagreements|I\s+will\s+argue|I\s+will\s+put\s+my\s+point|listen\s+to\s+theirs)\b/i,
   /\b(my\s+approach\s+is|my\s+tendency\s+is|my\s+philosophy\s+is|how\s+I\s+approach)\b/i,
 
@@ -436,7 +436,7 @@ export const DECLARATIVE_PERSONAL_STATEMENTS = [
   /\b(recently\s+|so\s+)?I\s+(built|created|developed|designed|implemented|deployed|worked|interned|applied)\b/i,
   /\bI\s+(started\s+by\s+learning|learned|studied|picked\s+up|been\s+learning)\b/i,
   /\bI\s+(usually|always|typically|often|prefer\s+using|rely\s+on)\b/i,
-  /\b(frustrates\s+me|I\s+hate|I\s+love|in\s+my\s+opinion|my\s+plan\s+was)\b/i,
+  /\b(frustrates\s+me|I\s+hate|I\s+love|I\s+value|in\s+my\s+opinion|my\s+plan\s+was)\b/i,
   /\bI\s+(am\s+not\s+satisfied|feel\s+I\s+am\s+slow|have\s+thought\s+too\s+much)\b/i,
   /\bif\s+I\s+have\s+enough\s+knowledge\b/i,
   /\bwhenever\s+i(\s+am|'m)?\s+stuck\b/i,
