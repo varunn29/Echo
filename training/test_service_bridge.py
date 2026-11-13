@@ -35,6 +35,12 @@ from training.training_controller import (
     TrainingLifecycleState,
     DEFAULT_MIN_SAMPLES,
 )
+from training.generate_with_adapter import (
+    build_shared_prompt,
+    normalize_platform,
+    enforce_x_character_limit,
+    format_linkedin_draft,
+)
 
 
 class MockServer:
@@ -514,6 +520,141 @@ class TestTrainingServiceBridge(unittest.TestCase):
         )
         self.assertEqual(code, 200)
         self.assertEqual(data["completeDraft"], "Draft text")
+        self.assertEqual(data["platform"], "General")
+        self.assertEqual(data["metadata"]["platform"], "General")
+
+    def test_generate_endpoint_propagates_platform_x_and_linkedin(self):
+        # 1. Platform X
+        code_x, data_x, _ = self._execute_request(
+            "POST",
+            "/generate",
+            body={"topic": "Personal coding journey", "platform": "X"},
+        )
+        self.assertEqual(code_x, 200)
+        self.assertEqual(data_x["platform"], "X")
+        self.assertEqual(data_x["metadata"]["platform"], "X")
+        self.assertEqual(self.mock_gen.generate.call_args.kwargs["platform"], "X")
+
+        # 2. Platform LinkedIn
+        code_li, data_li, _ = self._execute_request(
+            "POST",
+            "/generate",
+            body={"topic": "Career reflection", "platform": "LinkedIn"},
+        )
+        self.assertEqual(code_li, 200)
+        self.assertEqual(data_li["platform"], "LinkedIn")
+        self.assertEqual(data_li["metadata"]["platform"], "LinkedIn")
+        self.assertEqual(self.mock_gen.generate.call_args.kwargs["platform"], "LinkedIn")
+
+    def test_generate_endpoint_rejects_non_string_platform(self):
+        code, data, _ = self._execute_request(
+            "POST",
+            "/generate",
+            body={"topic": "Invalid platform", "platform": 123},
+        )
+        self.assertEqual(code, 400)
+        self.assertIn("Field 'platform' must be a string", data["error"])
+
+    def test_prompt_construction_influences_platform_guidance(self):
+        # 1. X platform prompt
+        prompt_x = build_shared_prompt(
+            topic="Clean architecture principles",
+            personal_knowledge=["Built backend with modular services."],
+            length_mode="short",
+            platform="X",
+        )
+        self.assertIn("Platform: X (concise social post, direct and punchy, respecting character limits).", prompt_x)
+        self.assertIn("Length: Short (1–2 sentences).", prompt_x)
+        self.assertIn("Topic: Clean architecture principles", prompt_x)
+
+        # 2. LinkedIn platform prompt
+        prompt_li = build_shared_prompt(
+            topic="Clean architecture principles",
+            personal_knowledge=["Built backend with modular services."],
+            length_mode="medium",
+            platform="LinkedIn",
+        )
+        self.assertIn("Platform: LinkedIn (professional yet natural formatting, appropriate paragraph breaks, and context).", prompt_li)
+        self.assertIn("Length: Medium (3–4 sentences).", prompt_li)
+
+        # 3. General platform prompt preserves exact original structure (no Platform header)
+        prompt_gen = build_shared_prompt(
+            topic="Clean architecture principles",
+            personal_knowledge=["Built backend with modular services."],
+            length_mode="medium",
+            platform="General",
+        )
+        self.assertNotIn("Platform:", prompt_gen)
+        self.assertIn("Instructions: Write an authentic first-person response in the author's conversational writing style.\nLength:", prompt_gen)
+
+    def test_platform_normalization_and_formatting(self):
+        # Normalization
+        self.assertEqual(normalize_platform("x"), "X")
+        self.assertEqual(normalize_platform("X"), "X")
+        self.assertEqual(normalize_platform("Twitter"), "X")
+        self.assertEqual(normalize_platform("linkedin"), "LinkedIn")
+        self.assertEqual(normalize_platform("LinkedIn"), "LinkedIn")
+        self.assertEqual(normalize_platform("LI"), "LinkedIn")
+        self.assertEqual(normalize_platform("General"), "General")
+        self.assertEqual(normalize_platform("unknown"), "General")
+        self.assertEqual(normalize_platform(None), "General")
+
+        # X character constraint enforcement
+        short_text = "I value software that behaves consistently and handles unexpected situations gracefully."
+        self.assertEqual(enforce_x_character_limit(short_text, max_chars=280), short_text)
+
+        # Multi-sentence exceeding 280 chars trims to last complete sentence
+        sentence_1 = "I prioritize building resilient applications that handle transient failures gracefully."
+        sentence_2 = "When external services become unavailable, user workflows must remain protected without data loss."
+        sentence_3 = "This design philosophy ensures our tools provide reliable and continuous productivity across diverse development workflows and edge scenarios."
+        long_combined = f"{sentence_1} {sentence_2} {sentence_3}"
+        self.assertGreater(len(long_combined), 280)
+        x_trimmed = enforce_x_character_limit(long_combined, max_chars=280)
+        self.assertLessEqual(len(x_trimmed), 280)
+        self.assertEqual(x_trimmed, f"{sentence_1} {sentence_2}")
+
+        # LinkedIn formatting inserts natural paragraph break for 3+ sentences
+        li_formatted = format_linkedin_draft(long_combined)
+        self.assertIn("\n\n", li_formatted)
+        p1, p2 = li_formatted.split("\n\n")
+        self.assertTrue(len(p1) > 0 and len(p2) > 0)
+
+    def test_enforce_x_character_limit_edge_cases(self):
+        # 1. Single sentence longer than 280 characters is limited to 280 characters or fewer
+        long_single_sentence = (
+            "I have spent many years designing complex distributed systems with event sourcing and message brokers, "
+            "always striving to ensure that every single component behaves deterministically and fails gracefully "
+            "under severe load spikes, because software reliability is the fundamental cornerstone of modern digital trust."
+        )
+        self.assertGreater(len(long_single_sentence), 280)
+        res_single = enforce_x_character_limit(long_single_sentence, max_chars=280)
+        self.assertLessEqual(len(res_single), 280)
+        self.assertTrue(len(res_single) > 0)
+        self.assertTrue(res_single.endswith("."))
+
+        # 2. Unpunctuated prose longer than 280 characters is limited to 280 characters or fewer
+        long_unpunctuated = (
+            "Building reliable software applications requires deep attention to subtle boundary conditions and state transitions "
+            "across different components because ignoring edge cases inevitably leads to production failures and data loss that "
+            "ultimately frustrates end users and damages customer trust in our product"
+        )
+        self.assertGreater(len(long_unpunctuated), 280)
+        res_unpunctuated = enforce_x_character_limit(long_unpunctuated, max_chars=280)
+        self.assertLessEqual(len(res_unpunctuated), 280)
+        self.assertTrue(len(res_unpunctuated) > 0)
+        self.assertTrue(res_unpunctuated.endswith("."))
+
+    def test_format_linkedin_draft_short_drafts_preserved(self):
+        # 1. One-sentence draft remains unchanged
+        single_sentence = "I built Task Tracker using React and TypeScript as an offline personal productivity tool."
+        self.assertEqual(format_linkedin_draft(single_sentence), single_sentence)
+
+        # 2. Two-sentence draft remains unchanged
+        two_sentences = (
+            "I built Task Tracker using React and TypeScript as an offline personal productivity tool. "
+            "It synchronizes seamlessly whenever local storage reconnects."
+        )
+        self.assertEqual(format_linkedin_draft(two_sentences), two_sentences)
 
     def test_reload_endpoint_still_functional(self):
         self.mock_gen.reload_adapter.return_value = {

@@ -30,6 +30,7 @@ try:
         load_active_adapter_metadata,
         save_active_adapter_metadata,
         validate_adapter_directory,
+        normalize_platform,
     )
     from training_controller import (
         TrainingController,
@@ -46,6 +47,7 @@ except ImportError:
         load_active_adapter_metadata,
         save_active_adapter_metadata,
         validate_adapter_directory,
+        normalize_platform,
     )
     from training.training_controller import (
         TrainingController,
@@ -745,6 +747,16 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
         else:
             length_mode = "medium"
 
+        raw_platform = payload.get("platform")
+        if raw_platform is not None and not isinstance(raw_platform, str):
+            self._send_json_response(
+                400,
+                {"error": "Field 'platform' must be a string if provided"},
+                origin=origin,
+            )
+            return
+        platform = normalize_platform(raw_platform)
+
         has_explicit_max_tokens = "maxTokens" in payload or "max_tokens" in payload
         max_tokens = None
         if has_explicit_max_tokens:
@@ -774,10 +786,11 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
 
         # Serialize inference with concurrency lock to avoid CPU thrashing
         logger.info(
-            "Generating personalized draft for topic: '%s' (mode: %s, length: %s, seed: %d)...",
+            "Generating personalized draft for topic: '%s' (mode: %s, length: %s, platform: %s, seed: %d)...",
             topic.strip()[:60],
             mode,
             length_mode,
+            platform,
             seed,
         )
         with generator_lock:
@@ -787,6 +800,7 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
                     personal_knowledge=personal_knowledge,
                     lead_in=lead_in.strip(),
                     length_mode=length_mode,
+                    platform=platform,
                     max_new_tokens=max_tokens,
                     temperature=temperature,
                     repetition_penalty=repetition_penalty,
@@ -807,6 +821,7 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
             "generatedText": res["generated_text"],
             "rawGeneratedText": res.get("raw_generated_text", res["generated_text"]),
             "leadIn": res["lead_in"],
+            "platform": res.get("platform", platform),
             "tokensGenerated": res["tokens_generated"],
             "tokenCount": res.get("final_token_count", res.get("tokens_generated", 0)),
             "finalTokenCount": res.get("final_token_count", res.get("tokens_generated", 0)),
@@ -827,6 +842,7 @@ class GenerationHTTPRequestHandler(BaseHTTPRequestHandler):
                 "topic": topic.strip(),
                 "mode": mode,
                 "lengthMode": length_mode,
+                "platform": res.get("platform", platform),
                 "model": generator.base_model_name,
                 "adapter": generator.adapter_path,
                 "repetitionPenalty": repetition_penalty,

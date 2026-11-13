@@ -444,6 +444,55 @@ def ensure_complete_thoughts(text: str) -> str:
     return text
 
 
+def normalize_platform(platform: Optional[str]) -> str:
+    """Normalizes platform string to standard values: 'X', 'LinkedIn', or 'General'."""
+    if not platform or not isinstance(platform, str):
+        return "General"
+    cleaned = platform.strip().lower()
+    if cleaned in ("x", "twitter"):
+        return "X"
+    if cleaned in ("linkedin", "li"):
+        return "LinkedIn"
+    return "General"
+
+
+def enforce_x_character_limit(text: str, max_chars: int = 280) -> str:
+    """
+    Ensures social post fits within X's character constraint (default: 280 characters).
+    Trims back to the last complete sentence that satisfies the constraint.
+    """
+    if not text or len(text) <= max_chars:
+        return text
+    sentences = extract_sentences(text)
+    accumulated: List[str] = []
+    for s in sentences:
+        candidate = (" ".join(accumulated + [s])).strip()
+        if len(candidate) <= max_chars:
+            accumulated.append(s)
+        else:
+            break
+    if accumulated:
+        return " ".join(accumulated).strip()
+    truncated = text[: max_chars - 1].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return ensure_complete_thoughts(truncated)
+
+
+def format_linkedin_draft(text: str) -> str:
+    """
+    Formats draft for LinkedIn with professional yet natural spacing, appropriate paragraph breaks, and context.
+    """
+    if not text or "\n\n" in text:
+        return text
+    sentences = extract_sentences(text)
+    if len(sentences) >= 3:
+        mid = 2 if len(sentences) >= 4 else 1
+        p1 = " ".join(s.strip() for s in sentences[:mid]).strip()
+        p2 = " ".join(s.strip() for s in sentences[mid:]).strip()
+        if p1 and p2:
+            return f"{p1}\n\n{p2}"
+    return text
+
+
 def build_zero_fact_autobiographical_response(
     topic: str,
     length_mode: str = "medium",
@@ -1100,12 +1149,14 @@ def build_shared_prompt(
     personal_knowledge: Optional[List[str]] = None,
     length_mode: str = "medium",
     lead_in: str = "",
+    platform: str = "General",
 ) -> str:
     """
     Constructs the shared compact prompt for LoRA V3 instruction-conditioned training and inference.
     Follows Phase 2 Step 4B Stage 2 approved prompt template:
 
     Instructions: Write an authentic first-person response in the author's conversational writing style.
+    [Platform: {platform_guidance}]
     Length: {length}
     Authoritative Facts:
     {verified_facts}
@@ -1121,6 +1172,13 @@ def build_shared_prompt(
     else:
         length_str = "Medium (3–4 sentences)."
 
+    norm_platform = normalize_platform(platform)
+    platform_line = ""
+    if norm_platform == "X":
+        platform_line = "Platform: X (concise social post, direct and punchy, respecting character limits).\n"
+    elif norm_platform == "LinkedIn":
+        platform_line = "Platform: LinkedIn (professional yet natural formatting, appropriate paragraph breaks, and context).\n"
+
     cleaned_facts: List[str] = []
     if personal_knowledge:
         aff_facts = format_affirmative_facts(personal_knowledge)
@@ -1135,6 +1193,7 @@ def build_shared_prompt(
 
     prompt = (
         "Instructions: Write an authentic first-person response in the author's conversational writing style.\n"
+        f"{platform_line}"
         f"Length: {length_str}\n"
         "Authoritative Facts:\n"
         f"{facts_block}\n"
@@ -1412,6 +1471,7 @@ class PersonalizedWritingGenerator:
         personal_knowledge: Optional[List[str]] = None,
         lead_in: str = "",
         length_mode: str = "medium",
+        platform: str = "General",
     ) -> str:
         """Formats personal knowledge and topic into the shared generation prompt (Stage 2 approved template)."""
         return build_shared_prompt(
@@ -1419,6 +1479,7 @@ class PersonalizedWritingGenerator:
             personal_knowledge=personal_knowledge,
             length_mode=length_mode,
             lead_in=lead_in,
+            platform=platform,
         )
 
     def generate(
@@ -1433,21 +1494,45 @@ class PersonalizedWritingGenerator:
         repetition_penalty: float = 1.15,
         do_sample: bool = True,
         seed: int = 42,
+        platform: str = "General",
     ) -> Dict[str, Any]:
         """Generates personalized text using the resident model with conservative Grounding V3 checks and length control."""
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model is not loaded. Call load_model() first.")
 
+        norm_platform = normalize_platform(platform)
         mode = (length_mode or "medium").lower()
-        if mode == "short":
-            default_max = 60
-            min_new_tokens = 15
-        elif mode == "long":
-            default_max = 220
-            min_new_tokens = 95
-        else:  # medium
-            default_max = 120
-            min_new_tokens = 45
+
+        if norm_platform == "X" and max_new_tokens is None:
+            if mode == "short":
+                default_max = 50
+                min_new_tokens = 15
+            elif mode == "long":
+                default_max = 85
+                min_new_tokens = 35
+            else:  # medium
+                default_max = 70
+                min_new_tokens = 25
+        elif norm_platform == "LinkedIn" and max_new_tokens is None:
+            if mode == "short":
+                default_max = 70
+                min_new_tokens = 20
+            elif mode == "long":
+                default_max = 240
+                min_new_tokens = 95
+            else:  # medium
+                default_max = 140
+                min_new_tokens = 45
+        else:
+            if mode == "short":
+                default_max = 60
+                min_new_tokens = 15
+            elif mode == "long":
+                default_max = 220
+                min_new_tokens = 95
+            else:  # medium
+                default_max = 120
+                min_new_tokens = 45
 
         effective_max_tokens = max_new_tokens if max_new_tokens is not None else default_max
         has_facts = personal_knowledge and any(item.strip() for item in personal_knowledge)
@@ -1457,6 +1542,10 @@ class PersonalizedWritingGenerator:
         # Enforce deterministic safe response immediately. Do not rely on model instructions or phrase-based detection.
         if not has_facts and is_autobiographical_topic(topic):
             safe_text = build_zero_fact_autobiographical_response(topic, length_mode=mode, lead_in=lead_in)
+            if norm_platform == "X":
+                safe_text = enforce_x_character_limit(safe_text)
+            elif norm_platform == "LinkedIn":
+                safe_text = format_linkedin_draft(safe_text)
             safe_tokens = len(self.tokenizer.encode(safe_text)) if self.tokenizer else len(safe_text.split())
             word_count = len(safe_text.split())
             sentence_count = len(extract_sentences(safe_text))
@@ -1465,7 +1554,8 @@ class PersonalizedWritingGenerator:
                 "topic": topic,
                 "personal_knowledge": personal_knowledge,
                 "lead_in": lead_in,
-                "prompt": f"[Zero-Fact Autobiographical Safe Mode] Topic: {topic}",
+                "platform": norm_platform,
+                "prompt": f"[Zero-Fact Autobiographical Safe Mode] Topic: {topic} (Platform: {norm_platform})",
                 "raw_generated_text": safe_text,
                 "generated_text": safe_text,
                 "complete_draft": safe_text,
@@ -1502,6 +1592,7 @@ class PersonalizedWritingGenerator:
                     "max_new_tokens": effective_max_tokens,
                     "min_new_tokens": min_new_tokens,
                     "length_mode": mode,
+                    "platform": norm_platform,
                     "temperature": temperature if do_sample else None,
                     "top_p": top_p if do_sample else None,
                     "repetition_penalty": repetition_penalty,
@@ -1510,7 +1601,7 @@ class PersonalizedWritingGenerator:
                 },
             }
 
-        prompt = self.build_prompt(topic, personal_knowledge, lead_in=lead_in, length_mode=mode)
+        prompt = self.build_prompt(topic, personal_knowledge, lead_in=lead_in, length_mode=mode, platform=norm_platform)
         inputs = self.tokenizer(prompt, return_tensors="pt")
         input_len = inputs["input_ids"].shape[1]
 
@@ -1553,6 +1644,10 @@ class PersonalizedWritingGenerator:
         # Reconstruct complete personal draft with lead_in if applicable
         complete_draft = f"{lead_in.strip()} {decoded_text}".strip() if lead_in else decoded_text
         complete_draft = ensure_complete_thoughts(complete_draft)
+        if norm_platform == "X":
+            complete_draft = enforce_x_character_limit(complete_draft)
+        elif norm_platform == "LinkedIn":
+            complete_draft = format_linkedin_draft(complete_draft)
 
         # Generation Quality & Grounding: Conservative Post-Generation Validation
         quality_result = validate_generation_quality(
@@ -1581,6 +1676,10 @@ class PersonalizedWritingGenerator:
                 fb_text = ensure_complete_thoughts(fb_text)
                 fb_draft = f"{lead_in.strip()} {fb_text}".strip() if lead_in else fb_text
                 fb_draft = ensure_complete_thoughts(fb_draft)
+                if norm_platform == "X":
+                    fb_draft = enforce_x_character_limit(fb_draft)
+                elif norm_platform == "LinkedIn":
+                    fb_draft = format_linkedin_draft(fb_draft)
                 fb_quality = validate_generation_quality(
                     fb_draft, topic, personal_knowledge, length_mode=mode
                 )
@@ -1599,6 +1698,10 @@ class PersonalizedWritingGenerator:
             # Enforce deterministic grounded synthesis fallback rather than generating poor/under-length drafts.
             if not fb_adopted:
                 safe_fallback = build_grounded_fallback_draft(topic, personal_knowledge, length_mode=mode, lead_in=lead_in)
+                if norm_platform == "X":
+                    safe_fallback = enforce_x_character_limit(safe_fallback)
+                elif norm_platform == "LinkedIn":
+                    safe_fallback = format_linkedin_draft(safe_fallback)
                 decoded_text = safe_fallback
                 complete_draft = safe_fallback
                 num_generated_tokens = len(self.tokenizer.encode(safe_fallback)) if self.tokenizer else len(safe_fallback.split())
@@ -1637,6 +1740,10 @@ class PersonalizedWritingGenerator:
                 alt_text = ensure_complete_thoughts(alt_text)
                 alt_draft = f"{lead_in.strip()} {alt_text}".strip() if lead_in else alt_text
                 alt_draft = ensure_complete_thoughts(alt_draft)
+                if norm_platform == "X":
+                    alt_draft = enforce_x_character_limit(alt_draft)
+                elif norm_platform == "LinkedIn":
+                    alt_draft = format_linkedin_draft(alt_draft)
                 alt_quality = validate_generation_quality(alt_draft, topic, personal_knowledge, length_mode=mode)
                 alt_hook = extract_opening_hook(alt_draft, num_words=5)
                 if alt_quality["is_acceptable"] and alt_hook != self.last_opening_hook:
@@ -1661,6 +1768,7 @@ class PersonalizedWritingGenerator:
             "topic": topic,
             "personal_knowledge": personal_knowledge,
             "lead_in": lead_in,
+            "platform": norm_platform,
             "prompt": prompt,
             "raw_generated_text": raw_generated_text,
             "generated_text": decoded_text,
@@ -1689,6 +1797,7 @@ class PersonalizedWritingGenerator:
                 "max_new_tokens": effective_max_tokens,
                 "min_new_tokens": min_new_tokens,
                 "length_mode": mode,
+                "platform": norm_platform,
                 "temperature": temperature if do_sample else None,
                 "top_p": top_p if do_sample else None,
                 "repetition_penalty": repetition_penalty,

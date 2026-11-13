@@ -29,6 +29,7 @@ import {
   type GenerationServiceHealth,
   type GenerationResponse,
   type GenerationLengthMode,
+  type GenerationPlatform,
 } from '../../utils/generationClient';
 
 import {
@@ -123,6 +124,7 @@ function WritingComposer() {
         leadIn: leadIn.trim(),
         mode: 'sampled',
         lengthMode,
+        platform: platform as GenerationPlatform,
         temperature: 0.65,
         repetitionPenalty: 1.15,
       });

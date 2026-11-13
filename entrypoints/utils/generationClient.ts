@@ -16,6 +16,7 @@ export interface GenerationServiceHealth {
 }
 
 export type GenerationLengthMode = 'short' | 'medium' | 'long';
+export type GenerationPlatform = 'X' | 'LinkedIn' | 'General';
 
 export interface GenerationRequest {
   topic: string;
@@ -23,6 +24,7 @@ export interface GenerationRequest {
   leadIn?: string;
   mode?: 'sampled' | 'greedy';
   lengthMode?: GenerationLengthMode;
+  platform?: GenerationPlatform | string;
   maxTokens?: number;
   temperature?: number;
   repetitionPenalty?: number;
@@ -33,6 +35,7 @@ export interface GenerationMetadata {
   topic: string;
   mode: string;
   lengthMode?: string;
+  platform?: string;
   model: string;
   adapter: string;
   repetitionPenalty: number;
@@ -55,6 +58,7 @@ export interface GenerationResponse {
   generatedText: string;
   rawGeneratedText?: string;
   leadIn?: string;
+  platform?: string;
   tokensGenerated?: number;
   tokenCount?: number;
   finalTokenCount?: number;
@@ -182,6 +186,11 @@ export async function generatePersonalizedDraft(
     throw new Error('Lead-in exceeds the maximum allowed length of 100 characters.');
   }
 
+  const platform = request.platform ?? 'General';
+  if (typeof platform !== 'string') {
+    throw new Error('Platform must be a string.');
+  }
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -192,6 +201,7 @@ export async function generatePersonalizedDraft(
       leadIn: leadIn,
       mode: request.mode ?? 'sampled',
       lengthMode: request.lengthMode ?? 'medium',
+      platform,
       maxTokens: request.maxTokens,
       temperature: request.temperature ?? 0.65,
       repetitionPenalty: request.repetitionPenalty ?? 1.15,
@@ -225,6 +235,7 @@ export async function generatePersonalizedDraft(
         generatedText: data.generatedText ?? '',
         rawGeneratedText: data.rawGeneratedText,
         leadIn: data.leadIn ?? '',
+        platform: data.platform ?? data.metadata?.platform ?? platform,
         tokensGenerated: data.tokensGenerated,
         tokenCount: data.tokenCount,
         finalTokenCount: data.finalTokenCount,

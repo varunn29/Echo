@@ -114,6 +114,12 @@ describe('Echo Generation Service Client', () => {
         generatePersonalizedDraft({ topic: 'Valid topic', leadIn: longLeadIn })
       ).rejects.toThrow('maximum allowed length of 100 characters');
     });
+
+    it('throws error when platform is not a string', async () => {
+      await expect(
+        generatePersonalizedDraft({ topic: 'Valid topic', platform: 123 as any })
+      ).rejects.toThrow('Platform must be a string');
+    });
   });
 
   describe('generatePersonalizedDraft - Service Interactions', () => {
@@ -176,6 +182,58 @@ describe('Echo Generation Service Client', () => {
       expect(res.metadata?.tokenCount).toBe(45);
       expect(res.metadata?.finalTokenCount).toBe(45);
       expect(res.metadata?.rawTokenCount).toBe(45);
+    });
+
+    it('propagates platform selection to request payload and response metadata', async () => {
+      let capturedPayloads: any[] = [];
+      global.fetch = vi.fn().mockImplementation(async (_url, options) => {
+        const payload = JSON.parse(options.body);
+        capturedPayloads.push(payload);
+        return {
+          status: 200,
+          json: async () => ({
+            completeDraft: `Draft for ${payload.platform}`,
+            generatedText: `Draft for ${payload.platform}`,
+            platform: payload.platform,
+            tokensGenerated: 25,
+            metadata: {
+              topic: payload.topic,
+              mode: payload.mode,
+              platform: payload.platform,
+              model: 'Qwen/Qwen3.5-0.8B-Base',
+              adapter: 'training-output/qwen3.5-0.8b-lora-v2',
+              repetitionPenalty: 1.15,
+              maxTokens: 85,
+            },
+          }),
+        } as Response;
+      });
+
+      // 1. Explicit 'X'
+      const resX = await generatePersonalizedDraft({
+        topic: 'Posting an update',
+        platform: 'X',
+      });
+      expect(capturedPayloads[0].platform).toBe('X');
+      expect(resX.platform).toBe('X');
+      expect(resX.completeDraft).toBe('Draft for X');
+
+      // 2. Explicit 'LinkedIn'
+      const resLI = await generatePersonalizedDraft({
+        topic: 'Career milestone reflection',
+        platform: 'LinkedIn',
+      });
+      expect(capturedPayloads[1].platform).toBe('LinkedIn');
+      expect(resLI.platform).toBe('LinkedIn');
+      expect(resLI.completeDraft).toBe('Draft for LinkedIn');
+
+      // 3. Omitted platform defaults to 'General'
+      const resGeneral = await generatePersonalizedDraft({
+        topic: 'General thoughts on coding',
+      });
+      expect(capturedPayloads[2].platform).toBe('General');
+      expect(resGeneral.platform).toBe('General');
+      expect(resGeneral.completeDraft).toBe('Draft for General');
     });
 
     it('throws user-friendly error on HTTP 503 model loading', async () => {
