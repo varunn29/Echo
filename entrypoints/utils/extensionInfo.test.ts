@@ -171,22 +171,17 @@ describe('Echo Extension Runtime Info & Service Startup Command Suite', () => {
     });
   });
 
-  describe('WritingComposer Ollama Model Synchronization', () => {
+  describe('WritingComposer Service Architecture Verification', () => {
     it('verifies DEFAULT_OLLAMA_MODEL is qwen3.5:2b', () => {
       expect(DEFAULT_OLLAMA_MODEL).toBe('qwen3.5:2b');
     });
 
-    it('verifies WritingComposer imports and uses DEFAULT_OLLAMA_MODEL', () => {
+    it('verifies WritingComposer removed duplicate Ollama architecture note and does not hardcode legacy models', () => {
       const composerPath = new URL('../dashboard/components/WritingComposer.tsx', import.meta.url);
       const composerSource = fs.readFileSync(composerPath, 'utf-8');
 
-      // Verify import from ollamaClient
-      expect(composerSource).toContain("import { DEFAULT_OLLAMA_MODEL } from '../../utils/ollamaClient';");
-
-      // Verify template usage
-      expect(composerSource).toContain('{DEFAULT_OLLAMA_MODEL}');
-
-      // Verify neither gemma2:2b nor llama3.2:3b is hardcoded
+      // Verify duplicate Ollama explanation is removed
+      expect(composerSource).not.toContain('Echo uses two separate local services');
       expect(composerSource).not.toContain('gemma2:2b');
       expect(composerSource).not.toContain('llama3.2:3b');
     });

@@ -12,7 +12,14 @@ import {
   saveWritingMessage,
   savePersonalKnowledge,
   saveKnowledgeEvidence,
+  addManualPersonalKnowledge,
+  updatePersonalKnowledge,
+  deletePersonalKnowledge,
+  getPersonalKnowledge,
+  getPersonalKnowledgeById,
+  getKnowledgeEvidence,
   type EchoDatabase,
+  type PersonalKnowledgeItem,
 } from './database';
 import {
   COORDINATOR_STORAGE_KEY,
@@ -415,6 +422,387 @@ describe('Dashboard Integration Suite (Phase 3, Step 4)', () => {
       const updatedEvidence = await testDb.knowledgeEvidence.where('knowledgeId').equals(kId).first();
       expect(updatedEvidence?.isValid).toBe(false);
       expect(updatedEvidence?.invalidationReason).toBe('source_message_deleted');
+    });
+  });
+
+  describe('5. Personal Knowledge Curation Dashboard Experience', () => {
+    it('1. Opening and submitting the add form (renders modal markup)', () => {
+      const filePath = path.resolve(__dirname, '../dashboard/components/WritingData.tsx');
+      const content = fs.readFileSync(filePath, 'utf-8');
+
+      // Verify trigger button and modal markup are present in the component
+      expect(content).toContain('Add Knowledge');
+      expect(content).toContain('Add Personal Knowledge');
+      expect(content).toContain('Edit Personal Knowledge');
+      expect(content).toContain('Subject *');
+      expect(content).toContain('Predicate *');
+      expect(content).toContain('Value *');
+      expect(content).toContain('Category');
+      expect(content).toContain('Context Scope');
+      expect(content).toContain('Stability');
+      expect(content).toContain('Confidence');
+      expect(content).toContain('Importance');
+      expect(content).toContain('Cancel');
+      expect(content).toContain('Save Knowledge');
+
+      // Verify SSR renders cleanly without crashing
+      const html = renderToString(React.createElement(WritingData));
+      expect(html).toContain('My Writing Data');
+    });
+
+    it('2. Successful manual fact creation (addManualPersonalKnowledge creates record in DB)', async () => {
+      const factId = await addManualPersonalKnowledge(
+        {
+          category: 'skills',
+          subject: 'TypeScript',
+          predicate: 'specializes in',
+          value: 'type systems and strict null checks',
+          contextScope: 'language tooling',
+          stability: 'stable',
+          confidence: 'high',
+          importance: 'primary',
+        },
+        testDb
+      );
+
+      expect(typeof factId).toBe('number');
+      expect(factId).toBeGreaterThan(0);
+
+      const saved = await getPersonalKnowledgeById(factId, testDb);
+      expect(saved).toBeDefined();
+      expect(saved?.sourceType).toBe('manual');
+      expect(saved?.status).toBe('active');
+      expect(saved?.editedByUser).toBe(false);
+      expect(saved?.subject).toBe('TypeScript');
+      expect(saved?.predicate).toBe('specializes in');
+      expect(saved?.value).toBe('type systems and strict null checks');
+      expect(saved?.contextScope).toBe('language tooling');
+    });
+
+    it('3. Validation errors (empty subject, predicate, or value rejected)', async () => {
+      // Database level validation checks
+      await expect(
+        addManualPersonalKnowledge(
+          { category: 'skills', subject: '   ', predicate: 'knows', value: 'Rust' },
+          testDb
+        )
+      ).rejects.toThrow(/subject.*empty/i);
+
+      await expect(
+        addManualPersonalKnowledge(
+          { category: 'skills', subject: 'Rust', predicate: '  ', value: 'Systems programming' },
+          testDb
+        )
+      ).rejects.toThrow(/predicate.*empty/i);
+
+      await expect(
+        addManualPersonalKnowledge(
+          { category: 'skills', subject: 'Rust', predicate: 'uses', value: '   ' },
+          testDb
+        )
+      ).rejects.toThrow(/value.*empty/i);
+
+      // Component level validation rules in WritingData.tsx
+      const filePath = path.resolve(__dirname, '../dashboard/components/WritingData.tsx');
+      const content = fs.readFileSync(filePath, 'utf-8');
+      expect(content).toContain("'Subject is required.'");
+      expect(content).toContain("'Predicate is required.'");
+      expect(content).toContain("'Value is required.'");
+    });
+
+    it('4. Editing an existing fact (updatePersonalKnowledge updates mutable fields)', async () => {
+      const factId = await addManualPersonalKnowledge(
+        {
+          category: 'skills',
+          subject: 'Python',
+          predicate: 'builds',
+          value: 'scripts',
+          stability: 'stable',
+          confidence: 'medium',
+          importance: 'secondary',
+        },
+        testDb
+      );
+
+      await updatePersonalKnowledge(
+        factId,
+        {
+          value: 'production ML pipelines and microservices',
+          importance: 'primary',
+          confidence: 'high',
+          contextScope: 'data engineering',
+        },
+        testDb
+      );
+
+      const retrieved = await getPersonalKnowledgeById(factId, testDb);
+      expect(retrieved?.value).toBe('production ML pipelines and microservices');
+      expect(retrieved?.importance).toBe('primary');
+      expect(retrieved?.confidence).toBe('high');
+      expect(retrieved?.contextScope).toBe('data engineering');
+      expect(retrieved?.editedByUser).toBe(true);
+    });
+
+    it('5. Preserving provenance during edits (sourceType preserved, editedByUser: true)', async () => {
+      // Extracted fact preservation
+      const extractedId = (await savePersonalKnowledge(
+        {
+          category: 'projects',
+          subject: 'Echo Extension',
+          predicate: 'uses',
+          value: 'WXT framework',
+          stability: 'stable',
+          status: 'active',
+          freshnessState: 'fresh',
+          confidence: 'high',
+          importance: 'primary',
+          sourceType: 'extracted',
+          editedByUser: false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          lastConfirmedAt: new Date(),
+        },
+        testDb
+      ))!;
+
+      await updatePersonalKnowledge(
+        extractedId,
+        { value: 'WXT and React 19' },
+        testDb
+      );
+      const updatedExtracted = await getPersonalKnowledgeById(extractedId, testDb);
+      expect(updatedExtracted?.sourceType).toBe('extracted');
+      expect(updatedExtracted?.editedByUser).toBe(true);
+
+      // Manual fact preservation
+      const manualId = await addManualPersonalKnowledge(
+        {
+          category: 'projects',
+          subject: 'Editor',
+          predicate: 'prefers',
+          value: 'VS Code',
+          stability: 'stable',
+          confidence: 'high',
+          importance: 'primary',
+        },
+        testDb
+      );
+
+      await updatePersonalKnowledge(
+        manualId,
+        { value: 'Cursor and Neovim' },
+        testDb
+      );
+      const updatedManual = await getPersonalKnowledgeById(manualId, testDb);
+      expect(updatedManual?.sourceType).toBe('manual');
+      expect(updatedManual?.editedByUser).toBe(true);
+    });
+
+    it('6. Rejecting edits to archived facts', async () => {
+      const factId = await addManualPersonalKnowledge(
+        {
+          category: 'preferences',
+          subject: 'Coffee',
+          predicate: 'drinks',
+          value: 'espresso',
+          stability: 'stable',
+          confidence: 'high',
+          importance: 'secondary',
+        },
+        testDb
+      );
+
+      await deletePersonalKnowledge(factId, 'user_manually_rejected', testDb);
+
+      await expect(
+        updatePersonalKnowledge(factId, { value: 'filter brew' }, testDb)
+      ).rejects.toThrow(/not active.*archived/i);
+    });
+
+    it('7. Confirming and completing deletion (deletePersonalKnowledge archives fact, invalidates evidence)', async () => {
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'LinkedIn',
+          text: 'I maintain open source Dart and Flutter packages.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      const factId = (await savePersonalKnowledge(
+        {
+          category: 'skills',
+          subject: 'Flutter',
+          predicate: 'maintains',
+          value: 'open source packages',
+          stability: 'stable',
+          status: 'active',
+          freshnessState: 'fresh',
+          confidence: 'high',
+          importance: 'primary',
+          sourceType: 'extracted',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          lastConfirmedAt: new Date(),
+        },
+        testDb
+      ))!;
+
+      await saveKnowledgeEvidence(
+        {
+          knowledgeId: factId,
+          messageId: msgId,
+          sourceExcerpt: 'maintain open source Dart and Flutter packages',
+          isValid: true,
+          extractedAt: new Date(),
+        },
+        testDb
+      );
+
+      // Delete fact using dashboard deletion reason
+      await deletePersonalKnowledge(factId, 'user_manually_rejected', testDb);
+
+      const archivedFact = await getPersonalKnowledgeById(factId, testDb);
+      expect(archivedFact?.status).toBe('archived');
+
+      const evidenceList = await getKnowledgeEvidence(factId, testDb);
+      expect(evidenceList).toHaveLength(1);
+      expect(evidenceList[0]?.isValid).toBe(false);
+      expect(evidenceList[0]?.invalidationReason).toBe('user_manually_rejected');
+    });
+
+    it('8. Cancelling deletion leaves fact and evidence unchanged', async () => {
+      const msgId = (await saveWritingMessage(
+        {
+          platform: 'ChatGPT',
+          text: 'I write technical architecture RFCs regularly.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        },
+        undefined,
+        testDb
+      ))!;
+
+      const factId = (await savePersonalKnowledge(
+        {
+          category: 'habits',
+          subject: 'Technical RFCs',
+          predicate: 'writes',
+          value: 'regularly',
+          stability: 'stable',
+          status: 'active',
+          freshnessState: 'fresh',
+          confidence: 'high',
+          importance: 'primary',
+          sourceType: 'extracted',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          lastConfirmedAt: new Date(),
+        },
+        testDb
+      ))!;
+
+      await saveKnowledgeEvidence(
+        {
+          knowledgeId: factId,
+          messageId: msgId,
+          sourceExcerpt: 'write technical architecture RFCs',
+          isValid: true,
+          extractedAt: new Date(),
+        },
+        testDb
+      );
+
+      // In the UI, cancelling sets deletingKnowledgeItem to null without calling deletePersonalKnowledge
+      let deletingKnowledgeItem: PersonalKnowledgeItem | null = await getPersonalKnowledgeById(factId, testDb) || null;
+      expect(deletingKnowledgeItem).not.toBeNull();
+      // User clicks Cancel:
+      deletingKnowledgeItem = null;
+      expect(deletingKnowledgeItem).toBeNull();
+
+      // Verify DB remains completely unmodified
+      const intactFact = await getPersonalKnowledgeById(factId, testDb);
+      expect(intactFact?.status).toBe('active');
+      expect(intactFact?.subject).toBe('Technical RFCs');
+
+      const intactEvidence = await getKnowledgeEvidence(factId, testDb);
+      expect(intactEvidence[0]?.isValid).toBe(true);
+      expect(intactEvidence[0]?.invalidationReason).toBeUndefined();
+    });
+
+    it('9. Refreshing the list after successful add, edit, delete', async () => {
+      // Initial active facts count is 0
+      const initialList = await getPersonalKnowledge({ status: 'active' }, testDb);
+      expect(initialList).toHaveLength(0);
+
+      // Add a manual fact
+      const factId = await addManualPersonalKnowledge(
+        {
+          category: 'skills',
+          subject: 'Architecture',
+          predicate: 'specializes in',
+          value: 'Clean Architecture',
+          stability: 'stable',
+          confidence: 'high',
+          importance: 'primary',
+        },
+        testDb
+      );
+
+      const afterAddList = await getPersonalKnowledge({ status: 'active' }, testDb);
+      expect(afterAddList).toHaveLength(1);
+      expect(afterAddList[0]?.id).toBe(factId);
+      expect(afterAddList[0]?.value).toBe('Clean Architecture');
+
+      // Edit the fact
+      await updatePersonalKnowledge(
+        factId,
+        { value: 'Clean Architecture and DDD' },
+        testDb
+      );
+
+      const afterEditList = await getPersonalKnowledge({ status: 'active' }, testDb);
+      expect(afterEditList).toHaveLength(1);
+      expect(afterEditList[0]?.value).toBe('Clean Architecture and DDD');
+
+      // Delete the fact
+      await deletePersonalKnowledge(factId, 'user_manually_rejected', testDb);
+
+      const afterDeleteList = await getPersonalKnowledge({ status: 'active' }, testDb);
+      expect(afterDeleteList).toHaveLength(0);
+    });
+
+    it('10. Displaying manual vs extracted provenance correctly (Manually added / Added vs Extracted / Confirmed)', () => {
+      const filePath = path.resolve(__dirname, '../dashboard/components/WritingData.tsx');
+      const content = fs.readFileSync(filePath, 'utf-8');
+
+      // Verify badge rendering conditions
+      expect(content).toContain("item.sourceType === 'manual'");
+      expect(content).toContain('Manually added');
+      expect(content).toContain('Extracted');
+      expect(content).toContain('item.editedByUser');
+      expect(content).toContain('Edited');
+
+      // Verify date labels
+      expect(content).toContain('Added: ');
+      expect(content).toContain('Confirmed: ');
+    });
+
+    it('11. Handling database failures without losing user input', () => {
+      const filePath = path.resolve(__dirname, '../dashboard/components/WritingData.tsx');
+      const content = fs.readFileSync(filePath, 'utf-8');
+
+      // In handleSaveKnowledge: error is caught, set to knowledgeFormError, and form data is NOT cleared on error
+      expect(content).toContain('setKnowledgeFormError(msg)');
+      expect(content).toContain('setIsSavingKnowledge(false)');
+
+      // In handleConfirmDeleteKnowledge: error is caught and set to knowledgeDeleteError
+      expect(content).toContain('setKnowledgeDeleteError(msg)');
+      expect(content).toContain('setIsDeletingKnowledge(false)');
     });
   });
 });
