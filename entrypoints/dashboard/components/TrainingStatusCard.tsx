@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Sparkles,
   Loader2,
@@ -43,46 +43,80 @@ export function TrainingStatusCard({ className = '' }: TrainingStatusCardProps) 
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isCommandCopied, setIsCommandCopied] = useState(false);
 
-  async function refreshStatus() {
-    setIsRefreshing(true);
+  const isMountedRef = useRef(true);
+  const isRefreshingRef = useRef(false);
+
+  const refreshStatus = useCallback(async () => {
+    if (isRefreshingRef.current) {
+      return;
+    }
+    isRefreshingRef.current = true;
+    if (isMountedRef.current) {
+      setIsRefreshing(true);
+    }
+
     try {
       // 1. Poll any active in-flight training job
       const polledJob = await pollActiveTrainingJob();
-      setActiveJob(polledJob);
+      if (isMountedRef.current) {
+        setActiveJob(polledJob);
+      }
 
       // 2. Query current database readiness
       const currentReadiness = await getTrainingReadiness();
-      setReadiness(currentReadiness);
+      if (isMountedRef.current) {
+        setReadiness(currentReadiness);
+      }
 
       // 3. Query training service status
       const currentStatus = await getTrainingStatus();
-      setServiceStatus(currentStatus);
+      if (isMountedRef.current) {
+        setServiceStatus(currentStatus);
+      }
     } catch (err) {
       console.warn('Echo: Failed to refresh training status:', err);
     } finally {
-      setIsLoading(false);
-      setIsRefreshing(false);
+      isRefreshingRef.current = false;
+      if (isMountedRef.current) {
+        setIsLoading(false);
+        setIsRefreshing(false);
+      }
     }
-  }
+  }, []);
 
+  // Track component mount status for cleanup
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // Initial check on mount
   useEffect(() => {
     refreshStatus();
+  }, [refreshStatus]);
 
-    // Poll every 5 seconds if a job is actively running
-    const interval = setInterval(() => {
-      if (
-        serviceStatus?.status === 'preparing' ||
-        serviceStatus?.status === 'training' ||
-        serviceStatus?.status === 'validating' ||
-        serviceStatus?.status === 'activating' ||
-        activeJob?.status === 'active'
-      ) {
+  // Automatic retry when offline or active job polling
+  useEffect(() => {
+    const isOffline = serviceStatus !== null && !serviceStatus.isOnline;
+    const isTrainingActive =
+      serviceStatus?.status === 'preparing' ||
+      serviceStatus?.status === 'training' ||
+      serviceStatus?.status === 'validating' ||
+      serviceStatus?.status === 'activating' ||
+      activeJob?.status === 'active';
+
+    // Only poll every 5 seconds if offline OR if training is actively running
+    if (isOffline || isTrainingActive) {
+      const interval = setInterval(() => {
         refreshStatus();
-      }
-    }, 5000);
+      }, 5000);
 
-    return () => clearInterval(interval);
-  }, [serviceStatus?.status, activeJob?.status]);
+      return () => clearInterval(interval);
+    }
+    // When service is online and no training job is active, avoid unnecessary frequent polling
+  }, [serviceStatus?.isOnline, serviceStatus?.status, activeJob?.status, refreshStatus]);
 
   const threshold = readiness?.threshold ?? DEFAULT_TRAINING_READINESS_THRESHOLD;
   const eligibleCount = readiness?.eligibleCount ?? 0;
@@ -134,54 +168,62 @@ export function TrainingStatusCard({ className = '' }: TrainingStatusCardProps) 
           ) : currentStage === 'completed' || activeJob?.status === 'completed' ? (
             <span className="inline-flex items-center gap-1.5 rounded-full bg-[#e4f1e4] px-3 py-1 text-xs font-medium text-[#2e6b36] border border-[#cfdfcf]">
               <CheckCircle2 size={13} />
-              Style Updated
+              Style Ready
             </span>
           ) : currentStage === 'error' || activeJob?.status === 'failed' ? (
-            <span className="inline-flex items-center gap-1.5 rounded-full bg-[#f9e7e7] px-3 py-1 text-xs font-medium text-[#8c3232] border border-[#f0cfcf]">
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-[#fcebeb] px-3 py-1 text-xs font-medium text-[#9b2c2c] border border-[#f5c6c6]">
               <AlertCircle size={13} />
-              Training Paused
+              Training Halted
+            </span>
+          ) : isThresholdMet ? (
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-[#eaf3ec] px-3 py-1 text-xs font-medium text-[#346b3f] border border-[#d4e5d7]">
+              <CheckCircle2 size={13} />
+              Threshold Met
             </span>
           ) : (
-            <span className="inline-flex items-center gap-1.5 rounded-full bg-[#e8f1e5] px-3 py-1 text-xs font-medium text-[#3b6647] border border-[#d6e4d2]">
-              <Cpu size={13} />
-              Standing By
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-[#edf1eb] px-3 py-1 text-xs font-medium text-[#556957] border border-[#dbe3d9]">
+              <Layers size={13} />
+              Collecting Samples
             </span>
           )}
 
+          {/* Refresh Button */}
           <button
             type="button"
             onClick={refreshStatus}
-            disabled={isRefreshing}
-            className="flex h-8 w-8 items-center justify-center rounded-lg text-[#68766d] hover:bg-[#eae8dc] transition-colors disabled:opacity-50"
-            title="Refresh training status"
+            disabled={isRefreshing || isLoading}
+            className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#dce3d7] bg-white/80 text-[#556957] transition-all hover:bg-white hover:text-[#203c30] disabled:opacity-50"
+            title="Refresh status"
           >
             <RefreshCw size={14} className={isRefreshing ? 'animate-spin' : ''} />
           </button>
         </div>
       </div>
 
-      {/* Progress towards 25-sample threshold */}
-      <div className="mt-5">
-        <div className="flex items-center justify-between text-xs mb-1.5">
-          <span className="font-medium text-[#465a4c]">
+      {/* Progress Bar Section */}
+      <div className="mt-5 space-y-2">
+        <div className="flex items-center justify-between text-xs">
+          <span className="text-[11px] font-medium text-[#52745e]">
             Eligible Samples Progress
           </span>
           <span className="font-semibold text-[#203c30]">
-            {eligibleCount} / {threshold} samples ({progressPercent}%)
+            {isThresholdMet
+              ? `${eligibleCount} / ${threshold} samples (Threshold reached)`
+              : `${eligibleCount} / ${threshold} samples (${progressPercent}%)`}
           </span>
         </div>
 
-        <div className="h-2 w-full overflow-hidden rounded-full bg-[#e5ebe0]">
+        <div className="h-2.5 w-full overflow-hidden rounded-full bg-[#e3ecdf]">
           <div
-            className={`h-full transition-all duration-500 rounded-full ${
-              isThresholdMet ? 'bg-[#4a7756]' : 'bg-[#7ba085]'
-            }`}
+            className="h-full rounded-full bg-gradient-to-r from-[#52745e] to-[#27523b] transition-all duration-500"
             style={{ width: `${progressPercent}%` }}
           />
         </div>
       </div>
 
-      {/* State-specific explanatory messaging */}
+
+
+      {/* Active Stage & Guidance Notification Area */}
       <div className="mt-4 rounded-xl bg-white/70 p-3.5 border border-[#e2e8dd] text-xs leading-relaxed">
         {!isOnline ? (
           <div className="space-y-2 text-[#735824]">

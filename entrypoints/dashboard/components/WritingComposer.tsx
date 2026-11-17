@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   ArrowUpRight,
   Globe2,
@@ -38,8 +38,6 @@ import {
 } from '../../utils/knowledgeRetrieval';
 
 import {
-  getExtensionId,
-  buildServiceStartupCommand,
   copyToClipboard,
 } from '../../utils/extensionInfo';
 
@@ -63,7 +61,6 @@ function WritingComposer() {
   const [generatedDraft, setGeneratedDraft] = useState('');
   const [generationMeta, setGenerationMeta] = useState<GenerationResponse | null>(null);
   const [isCopied, setIsCopied] = useState(false);
-  const [isCommandCopied, setIsCommandCopied] = useState(false);
 
   const platforms = [
     {
@@ -80,27 +77,65 @@ function WritingComposer() {
     },
   ];
 
-  // Poll service health on component mount
-  useEffect(() => {
-    checkHealth();
-  }, []);
+  const isMountedRef = useRef(true);
+  const isCheckingRef = useRef(false);
 
-  async function checkHealth() {
-    setIsCheckingService(true);
+  const checkHealth = useCallback(async () => {
+    if (isCheckingRef.current) {
+      return;
+    }
+    isCheckingRef.current = true;
+    if (isMountedRef.current) {
+      setIsCheckingService(true);
+    }
+
     try {
       const health = await checkGenerationServiceHealth();
-      setServiceStatus(health);
+      if (isMountedRef.current) {
+        setServiceStatus(health);
+      }
     } catch {
-      setServiceStatus({
-        isOnline: false,
-        isModelReady: false,
-        status: 'offline',
-        error: 'Unable to reach local generation service.',
-      });
+      if (isMountedRef.current) {
+        setServiceStatus({
+          isOnline: false,
+          isModelReady: false,
+          status: 'offline',
+          error: 'Unable to reach local generation service.',
+        });
+      }
     } finally {
-      setIsCheckingService(false);
+      isCheckingRef.current = false;
+      if (isMountedRef.current) {
+        setIsCheckingService(false);
+      }
     }
-  }
+  }, []);
+
+  // Track component mount status for cleanup
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // Initial health check on component mount
+  useEffect(() => {
+    checkHealth();
+  }, [checkHealth]);
+
+  // Automatic retry when service is offline or loading model
+  useEffect(() => {
+    // Only poll every 5 seconds if the service is offline or still loading the model
+    if (serviceStatus !== null && serviceStatus.status !== 'ready') {
+      const interval = setInterval(() => {
+        checkHealth();
+      }, 5000);
+
+      return () => clearInterval(interval);
+    }
+    // When service is ready, avoid unnecessary frequent polling
+  }, [serviceStatus?.status, checkHealth]);
 
   async function handleGenerate() {
     const trimmedTopic = topic.trim();
@@ -113,14 +148,30 @@ function WritingComposer() {
     setIsCopied(false);
 
     try {
-      // 1. Retrieve relevant personal knowledge from IndexedDB
-      const knowledgeResult = await retrieveRelevantKnowledge(trimmedTopic);
-      setRetrievedKnowledge(knowledgeResult);
+      // 1. Retrieve relevant personal knowledge from IndexedDB with graceful degradation
+      let knowledgeResult: RetrievedKnowledgeResult | null = null;
+      try {
+        knowledgeResult = await retrieveRelevantKnowledge(trimmedTopic);
+        if (isMountedRef.current) {
+          setRetrievedKnowledge(knowledgeResult);
+        }
+      } catch (kbErr) {
+        console.warn('Echo WritingComposer: Personal knowledge retrieval failed:', kbErr);
+        knowledgeResult = {
+          items: [],
+          formattedStrings: [],
+          keywordsUsed: [],
+          hasRelevantKnowledge: false,
+        };
+        if (isMountedRef.current) {
+          setRetrievedKnowledge(knowledgeResult);
+        }
+      }
 
       // 2. Request personalized draft from Python service
       const response = await generatePersonalizedDraft({
         topic: trimmedTopic,
-        personalKnowledge: knowledgeResult.formattedStrings,
+        personalKnowledge: knowledgeResult?.formattedStrings ?? [],
         leadIn: leadIn.trim(),
         mode: 'sampled',
         lengthMode,
@@ -130,14 +181,20 @@ function WritingComposer() {
       });
 
       // 3. Set generated text as editable draft
-      setGeneratedDraft(response.completeDraft);
-      setGenerationMeta(response);
+      if (isMountedRef.current) {
+        setGeneratedDraft(response.completeDraft);
+        setGenerationMeta(response);
+      }
     } catch (err: unknown) {
       const errorMsg =
         err instanceof Error ? err.message : 'An error occurred during generation.';
-      setGenerationError(errorMsg);
+      if (isMountedRef.current) {
+        setGenerationError(errorMsg);
+      }
     } finally {
-      setIsGenerating(false);
+      if (isMountedRef.current) {
+        setIsGenerating(false);
+      }
     }
   }
 
@@ -161,333 +218,123 @@ function WritingComposer() {
     }
   }
 
-  async function handleCopyStartupCommand() {
-    const cmd = buildServiceStartupCommand();
-    const success = await copyToClipboard(cmd);
-    if (success) {
-      setIsCommandCopied(true);
-      setTimeout(() => setIsCommandCopied(false), 2200);
-    }
-  }
-
   const isServiceReady = serviceStatus?.status === 'ready';
   const isOffline = serviceStatus?.status === 'offline';
   const isLoadingModel = serviceStatus?.status === 'loading';
 
   return (
-    <section className="relative z-10 space-y-6 px-12 pb-16">
-      {/* Service Offline / Degraded Notice */}
-      {isOffline && (
-        <div className="space-y-3 rounded-2xl border border-[#e2d5c5] bg-[#fffaf3] p-4 text-[#8a5d3b] shadow-sm">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div className="flex items-start gap-3">
-              <AlertCircle size={18} className="mt-0.5 shrink-0 text-[#b46d3f]" />
-              <div className="text-[12px] leading-5">
-                <div className="flex items-center gap-2">
-                  <span className="font-semibold text-[#6d4323]">Local Generation Service is offline</span>
-                  {getExtensionId() && (
-                    <span className="rounded bg-[#f0e4d2] px-1.5 py-0.5 font-mono text-[10px] text-[#7a4e2e]">
-                      ID: {getExtensionId().slice(0, 8)}...
-                    </span>
-                  )}
-                </div>
-                <p className="mt-0.5 text-[11px] text-[#9a6e4d]">
-                  Echo requires CORS authorization for your specific Chrome extension origin. Run the command below to start the service:
-                </p>
-              </div>
-            </div>
-
-            <button
-              type="button"
-              onClick={checkHealth}
-              disabled={isCheckingService}
-              className="flex items-center gap-1.5 rounded-lg border border-[#d9c4b0] bg-white px-3 py-1.5 text-[11px] font-medium text-[#7a4e2e] transition hover:bg-[#fbf7f0] disabled:opacity-50"
-            >
-              <RefreshCw
-                size={12}
-                className={isCheckingService ? 'animate-spin' : ''}
-              />
-              {isCheckingService ? 'Checking...' : 'Check Connection'}
-            </button>
-          </div>
-
-          {/* Interactive Startup Command Display */}
-          <div className="flex items-center justify-between gap-2 rounded-xl border border-[#ecdccb] bg-[#fdf8f0] px-3 py-2">
-            <code className="select-all font-mono text-[11px] text-[#5c371b] break-all">
-              {buildServiceStartupCommand()}
-            </code>
-            <button
-              type="button"
-              onClick={handleCopyStartupCommand}
-              className="flex shrink-0 items-center gap-1 rounded-lg border border-[#d9c4b0] bg-white px-2.5 py-1 text-[11px] font-medium text-[#7a4e2e] shadow-xs transition hover:bg-[#f7efe3] active:scale-95 cursor-pointer"
-              title="Copy service startup command"
-            >
-              {isCommandCopied ? (
-                <>
-                  <Check size={12} className="text-[#3b754e]" />
-                  <span className="text-[#3b754e]">Copied!</span>
-                </>
-              ) : (
-                <>
-                  <Copy size={12} />
-                  <span>Copy</span>
-                </>
-              )}
-            </button>
-          </div>
-
-          {/* Architecture note: Ollama vs Python service */}
-          <div className="flex items-center gap-1.5 text-[11px] text-[#a57a5a]">
-            <Info size={12} className="shrink-0" />
-            <span>
-              Echo uses two separate local services: <strong>Ollama</strong> (<code className="font-mono text-[10px]">{DEFAULT_OLLAMA_MODEL}</code> on port 11434) for private knowledge graph extraction, and this <strong>Python service</strong> (port 11435) for personalized LoRA generation.
-            </span>
-          </div>
-        </div>
-      )}
-
-      {/* Main Composer Box */}
-      <div className="overflow-hidden rounded-2xl border border-[#dce2d7] bg-[#fffef9]/90 shadow-[0_12px_40px_rgba(35,60,45,0.07)] backdrop-blur-md">
+    <section className="relative px-12 pb-16 pt-2">
+      <div className="rounded-2xl border border-[#dce3d7] bg-[#fbfaf6]/95 p-8 shadow-sm backdrop-blur-sm">
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-[#e9e9df] px-6 py-5">
+        <div className="flex flex-col justify-between gap-4 border-b border-[#e5ebe0] pb-6 sm:flex-row sm:items-center">
           <div>
-            <div className="flex items-center gap-2">
-              <Sparkles size={16} className="text-[#66836d]" />
-
-              <h2 className="text-[14px] font-semibold tracking-tight text-[#294435]">
-                Create something meaningful
-              </h2>
-            </div>
-
-            <p className="mt-1.5 pl-6 text-[11px] text-[#899087]">
-              Start with an idea. We'll help you find the words.
+            <h2 className="font-serif text-[28px] leading-tight text-[#203c30]">
+              Create something meaningful
+            </h2>
+            <p className="mt-1 text-[13px] text-[#68766d]">
+              Draft with your authentic voice,{' '}
+              <span className="italic text-[#839587]">grounded in who you are.</span>
             </p>
           </div>
 
-          {/* Service Status Indicator Badge */}
-          <div className="flex items-center gap-2">
-            {isServiceReady ? (
-              <span className="inline-flex items-center gap-1.5 rounded-full bg-[#edf1e9] px-3 py-1 text-[10px] font-medium text-[#46694e]">
-                <span className="h-1.5 w-1.5 rounded-full bg-[#529362]" />
-                LoRA V2 Ready
+          {/* Model Status Pill */}
+          <div className="flex items-center gap-2 self-start sm:self-auto">
+            {isCheckingService ? (
+              <span className="flex items-center gap-1.5 rounded-full bg-[#f0f3ed] px-3 py-1 text-xs text-[#68766d]">
+                <RefreshCw size={12} className="animate-spin" />
+                Checking service...
               </span>
+            ) : isServiceReady ? (
+              <div className="flex items-center gap-2 rounded-full border border-[#d2e2d5] bg-[#edf4ee] px-3 py-1 text-xs text-[#2c533e]">
+                <span className="relative flex h-2 w-2">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#528762] opacity-50" />
+                  <span className="relative inline-flex h-2 w-2 rounded-full bg-[#3b6d4e]" />
+                </span>
+                <span className="font-medium">
+                  {serviceStatus?.adapter
+                    ? `${serviceStatus.adapter.toUpperCase()} Active`
+                    : 'Base Model Ready'}
+                </span>
+              </div>
             ) : isLoadingModel ? (
-              <span className="inline-flex items-center gap-1.5 rounded-full bg-[#fbf5e6] px-3 py-1 text-[10px] font-medium text-[#94762c]">
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[#cfa12f]" />
-                Model Loading...
-              </span>
+              <div className="flex items-center gap-2 rounded-full border border-[#fae2c8] bg-[#fef5ec] px-3 py-1 text-xs text-[#9c581a]">
+                <Loader2 size={12} className="animate-spin text-[#c27329]" />
+                <span>Loading weights into memory...</span>
+              </div>
             ) : (
-              <span className="inline-flex items-center gap-1.5 rounded-full bg-[#f8ecec] px-3 py-1 text-[10px] font-medium text-[#a14343]">
-                <span className="h-1.5 w-1.5 rounded-full bg-[#c74c4c]" />
-                Service Offline
-              </span>
+              <div className="flex items-center gap-2 rounded-full border border-[#ebd6d6] bg-[#fbf2f2] px-3 py-1 text-xs text-[#8c3535]">
+                <span className="h-2 w-2 rounded-full bg-[#bf4343]" />
+                <span>Service Offline</span>
+              </div>
             )}
 
             <button
               type="button"
               onClick={checkHealth}
               disabled={isCheckingService}
+              className="rounded-lg p-1.5 text-[#89978a] hover:bg-[#edf2ea] hover:text-[#203c30] transition-colors disabled:opacity-50"
               title="Refresh Service Status"
-              aria-label="Refresh Service Status"
-              className="rounded-lg p-1 text-[#899087] transition hover:bg-[#eeefe8] hover:text-[#304438]"
             >
-              <RefreshCw
-                size={12}
-                className={isCheckingService ? 'animate-spin' : ''}
-              />
+              <RefreshCw size={13} className={isCheckingService ? 'animate-spin' : ''} />
             </button>
           </div>
         </div>
 
-        {/* Topic Input */}
-        <div className="px-6 pt-5 pb-3">
-          <div className="mb-2 flex items-center justify-between">
-            <label
-              htmlFor="writing-topic"
-              className="block text-[10px] font-semibold uppercase tracking-[0.16em] text-[#788578]"
-            >
-              What's on your mind?
-            </label>
-            <span className="text-[10px] text-[#9ea89d]">
-              {topic.length}/500
-            </span>
-          </div>
-
-          <textarea
-            id="writing-topic"
-            value={topic}
-            maxLength={500}
-            onChange={(e) => setTopic(e.target.value)}
-            placeholder="Share an idea, a project you built, a learning experience, or something you'd like to post about..."
-            rows={3}
-            disabled={isGenerating}
-            className="w-full resize-none bg-transparent text-[14px] leading-7 text-[#304438] outline-none placeholder:text-[#a4aaa0] disabled:opacity-60"
-          />
-        </div>
-
-        {/* Lead-in Input (Optional) */}
-        <div className="border-t border-[#f0f2eb] px-6 py-3">
-          <div className="mb-1 flex items-center justify-between">
-            <label
-              htmlFor="writing-leadin"
-              className="block text-[10px] font-semibold uppercase tracking-[0.16em] text-[#788578]"
-            >
-              Optional Lead-In Phrase
-            </label>
-            <span className="text-[10px] text-[#9ea89d]">
-              {leadIn.length}/100
-            </span>
-          </div>
-
-          <input
-            id="writing-leadin"
-            type="text"
-            value={leadIn}
-            maxLength={100}
-            onChange={(e) => setLeadIn(e.target.value)}
-            placeholder="e.g. Over the past few months, I've been focusing on..."
-            disabled={isGenerating}
-            className="w-full bg-transparent text-[12px] text-[#304438] outline-none placeholder:text-[#a4aaa0] disabled:opacity-60"
-          />
-        </div>
-
-        {/* Personal Knowledge Preview Banner */}
-        {retrievedKnowledge && (
-          <div className="border-t border-[#e9e9df] bg-[#fafbf7] px-6 py-3">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Brain size={14} className="text-[#55725a]" />
-                {retrievedKnowledge.hasRelevantKnowledge ? (
-                  <span className="text-[11px] font-medium text-[#3b5943]">
-                    Found {retrievedKnowledge.items.length} relevant personal fact
-                    {retrievedKnowledge.items.length === 1 ? '' : 's'} in your writing data
-                  </span>
-                ) : (
-                  <span className="text-[11px] text-[#7a8579]">
-                    No matching personal facts found; generating with learned writing style only.
-                  </span>
-                )}
-              </div>
-
-              {retrievedKnowledge.hasRelevantKnowledge && (
-                <button
-                  type="button"
-                  onClick={() => setIsKnowledgeExpanded(!isKnowledgeExpanded)}
-                  className="flex items-center gap-1 text-[11px] font-medium text-[#52745e] hover:underline"
-                >
-                  {isKnowledgeExpanded ? 'Hide facts' : 'View facts'}
-                  {isKnowledgeExpanded ? (
-                    <ChevronUp size={13} />
-                  ) : (
-                    <ChevronDown size={13} />
-                  )}
-                </button>
-              )}
-            </div>
-
-            {/* Expandable Knowledge Chips */}
-            {isKnowledgeExpanded && retrievedKnowledge.hasRelevantKnowledge && (
-              <div className="mt-3 flex flex-wrap gap-2 pt-2 border-t border-[#e8ebe3]">
-                {retrievedKnowledge.formattedStrings.map((fact, idx) => (
-                  <div
-                    key={idx}
-                    className="rounded-lg border border-[#dbe2d6] bg-white px-2.5 py-1 text-[11px] text-[#415a48]"
-                  >
-                    {fact}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Generation Error Banner */}
-        {generationError && (
-          <div className="border-t border-[#f0dede] bg-[#fff5f5] px-6 py-3 text-[12px] text-[#9b3a3a]">
-            <span className="font-semibold">Generation failed: </span>
-            {generationError}
-          </div>
-        )}
-
-        {/* Zero-Fact Safety Notice */}
-        {retrievedKnowledge?.isAutobiographicalWithoutFacts && (
-          <div className="flex items-center gap-2.5 border-t border-[#e2d5c5] bg-[#fffaf3] px-6 py-2.5 text-[11px] text-[#8a5d3b]">
-            <Info size={14} className="shrink-0 text-[#b46d3f]" />
-            <span>
-              <strong className="font-semibold">Notice:</strong> No verified personal notes exist in Echo for this topic. Echo will provide a general reflection to prevent fabricating personal experiences.
-            </span>
-          </div>
-        )}
-
-        {/* Footer Bar */}
-        <div className="flex flex-wrap items-center justify-between gap-4 border-t border-[#e9e9df] bg-[#fafaf5]/80 px-6 py-4">
-          <div className="flex flex-wrap items-center gap-4">
-            {/* Platform selector */}
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="mr-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#899087]">
-                Write for
+        {/* Composer Controls */}
+        <div className="mt-6 space-y-6">
+          {/* Platform & Length Selectors */}
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            {/* Platform Selector */}
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] font-medium uppercase tracking-wider text-[#68766d]">
+                Platform:
               </span>
-
-              <div className="flex items-center gap-1 rounded-xl bg-[#eeefe8] p-1">
-                {platforms.map((item) => {
-                  const isActive = platform === item.name;
-
+              <div className="flex items-center gap-1.5">
+                {platforms.map((p) => {
+                  const isSelected = platform === p.name;
                   return (
                     <button
-                      key={item.name}
+                      key={p.name}
                       type="button"
-                      disabled={isGenerating}
-                      onClick={() => setPlatform(item.name)}
-                      className={`flex items-center gap-2 rounded-lg px-3 py-2 text-[11px] font-medium transition-all ${
-                        isActive
-                          ? 'bg-white text-[#315b42] shadow-sm'
-                          : 'text-[#818b80] hover:text-[#315b42]'
-                      } disabled:opacity-60`}
+                      onClick={() => setPlatform(p.name)}
+                      className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-all ${
+                        isSelected
+                          ? 'border-[#52745e] bg-[#eef3eb] text-[#203c30] ring-1 ring-[#52745e]/20'
+                          : 'border-[#dce3d7] bg-white text-[#68766d] hover:border-[#9ab19e] hover:text-[#203c30]'
+                      }`}
                     >
-                      {item.icon ? (
-                        <FontAwesomeIcon
-                          icon={item.icon}
-                          className="text-[13px]"
-                        />
+                      {p.icon ? (
+                        <FontAwesomeIcon icon={p.icon} className="text-[11px]" />
                       ) : (
-                        <Globe2 size={14} strokeWidth={1.8} />
+                        <Globe2 size={12} />
                       )}
-
-                      {item.name}
+                      <span>{p.name}</span>
                     </button>
                   );
                 })}
               </div>
             </div>
 
-            {/* Length selector */}
+            {/* Length Mode Selector */}
             <div className="flex items-center gap-2">
-              <span className="mr-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#899087]">
-                Length
+              <span className="text-[11px] font-medium uppercase tracking-wider text-[#68766d]">
+                Length:
               </span>
-
-              <div className="flex items-center gap-1 rounded-xl bg-[#eeefe8] p-1">
-                {(['short', 'medium', 'long'] as const).map((mode) => {
-                  const isActive = lengthMode === mode;
-                  const labelMap = {
-                    short: 'Short (1–2s)',
-                    medium: 'Medium (Post)',
-                    long: 'Long (Detailed)',
-                  };
-
+              <div className="inline-flex rounded-lg border border-[#dce3d7] bg-white p-0.5 text-xs">
+                {(['short', 'medium', 'long'] as GenerationLengthMode[]).map((mode) => {
+                  const isSelected = lengthMode === mode;
                   return (
                     <button
                       key={mode}
                       type="button"
-                      disabled={isGenerating}
                       onClick={() => setLengthMode(mode)}
-                      className={`rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition-all ${
-                        isActive
-                          ? 'bg-white text-[#315b42] shadow-sm'
-                          : 'text-[#818b80] hover:text-[#315b42]'
-                      } disabled:opacity-60`}
+                      className={`rounded-md px-2.5 py-1 capitalize transition-all ${
+                        isSelected
+                          ? 'bg-[#203c30] font-medium text-[#f7f6ed] shadow-2xs'
+                          : 'text-[#68766d] hover:text-[#203c30]'
+                      }`}
                     >
-                      {labelMap[mode]}
+                      {mode}
                     </button>
                   );
                 })}
@@ -495,43 +342,155 @@ function WritingComposer() {
             </div>
           </div>
 
-          {/* Generate button */}
-          <button
-            type="button"
-            onClick={handleGenerate}
-            disabled={!topic.trim() || isGenerating || !isServiceReady}
-            className="group flex items-center gap-3 rounded-xl bg-[#234b37] px-5 py-3 text-[12px] font-semibold text-[#f7f6ed] shadow-[0_4px_12px_rgba(35,75,55,0.15)] transition-all hover:bg-[#315d43] disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            {isGenerating ? (
-              <>
-                <Loader2 size={15} className="animate-spin text-[#d8e6dc]" />
-                <span>Generating draft...</span>
-              </>
-            ) : (
-              <>
-                <Sparkles size={15} />
-                <span>Generate</span>
-                <ArrowUpRight
-                  size={14}
-                  className="transition-transform group-hover:-translate-y-0.5 group-hover:translate-x-0.5"
-                />
-              </>
-            )}
-          </button>
+          {/* Topic & Premise Input */}
+          <div className="space-y-2">
+            <label
+              htmlFor="composer-topic"
+              className="block text-xs font-semibold text-[#203c30]"
+            >
+              What would you like to write about?
+            </label>
+            <div className="relative rounded-2xl border border-[#dce3d7] bg-[#fbfaf6] p-5 shadow-2xs focus-within:border-[#7ba085] focus-within:bg-white transition-all">
+              <textarea
+                id="composer-topic"
+                value={topic}
+                onChange={(e) => setTopic(e.target.value)}
+                placeholder="Share a thought, reflection, technical opinion, or update... (e.g., 'Reflections on why local-first architectures protect human autonomy')"
+                rows={3}
+                className="w-full resize-none bg-transparent text-sm leading-relaxed text-[#203c30] placeholder-[#9ca79e] outline-none"
+              />
+
+              <div className="mt-3 flex items-center justify-between border-t border-[#f0f3ed] pt-3 text-[11px] text-[#89978a]">
+                <span>
+                  {topic.trim() ? topic.trim().split(/\s+/).length : 0} words
+                </span>
+                <span className="text-[#718576]">
+                  Personal knowledge facts will be retrieved automatically
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Optional Lead-In Input */}
+          <div className="space-y-1.5">
+            <label
+              htmlFor="composer-leadin"
+              className="flex items-center justify-between text-xs text-[#526356]"
+            >
+              <span className="font-medium">Opening Sentence / Lead-In (Optional)</span>
+              <span className="text-[10px] text-[#89978a]">Helps guide the exact starting cadence</span>
+            </label>
+            <input
+              id="composer-leadin"
+              type="text"
+              value={leadIn}
+              onChange={(e) => setLeadIn(e.target.value)}
+              placeholder="e.g., 'Over the past month, I noticed something interesting...'"
+              className="w-full rounded-xl border border-[#dce3d7] bg-[#fbfaf6] px-4 py-2.5 text-xs text-[#203c30] placeholder-[#a6b1a8] outline-none focus:border-[#7ba085] focus:bg-white transition-all"
+            />
+          </div>
+
+          {/* Action Row */}
+          <div className="flex flex-col-reverse justify-between gap-4 pt-2 sm:flex-row sm:items-center">
+            {/* Knowledge Preview Toggle */}
+            <div>
+              {retrievedKnowledge && retrievedKnowledge.items.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setIsKnowledgeExpanded(!isKnowledgeExpanded)}
+                  className="flex items-center gap-1.5 text-xs text-[#456b4f] hover:text-[#203c30] transition-colors"
+                >
+                  <Brain size={14} className="text-[#528762]" />
+                  <span>
+                    {retrievedKnowledge.items.length} personal fact
+                    {retrievedKnowledge.items.length === 1 ? '' : 's'} grounded
+                  </span>
+                  {isKnowledgeExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                </button>
+              )}
+            </div>
+
+            {/* Generate Button */}
+            <button
+              type="button"
+              onClick={handleGenerate}
+              disabled={isGenerating || !topic.trim() || isOffline}
+              className={`flex items-center justify-center gap-2 rounded-xl px-6 py-3 text-sm font-semibold transition-all shadow-sm sm:w-auto ${
+                isGenerating || !topic.trim() || isOffline
+                  ? 'bg-[#839b89] cursor-not-allowed text-[#e5ebe4]'
+                  : 'bg-[#234b37] text-[#f7f6ed] hover:bg-[#2d5d44] hover:shadow-md'
+              }`}
+            >
+              {isGenerating ? (
+                <>
+                  <Loader2 size={16} className="animate-spin text-white" />
+                  <span>Drafting in your voice...</span>
+                </>
+              ) : (
+                <>
+                  <Sparkles size={16} />
+                  <span>Generate Draft</span>
+                  <ArrowUpRight size={14} className="opacity-80" />
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Grounded Knowledge Drawer */}
+          {isKnowledgeExpanded && retrievedKnowledge && retrievedKnowledge.items.length > 0 && (
+            <div className="rounded-xl border border-[#dce3d7] bg-[#f5f8f3] p-4 text-xs">
+              <div className="mb-2 flex items-center justify-between font-semibold text-[#294d36]">
+                <div className="flex items-center gap-1.5">
+                  <Brain size={14} />
+                  <span>Active Personal Knowledge Facts:</span>
+                </div>
+                <span className="text-[10px] font-normal text-[#5c7263]">
+                  Matches: {retrievedKnowledge.keywordsUsed.join(', ')}
+                </span>
+              </div>
+              <ul className="space-y-1.5 pl-1">
+                {retrievedKnowledge.items.map((fact) => (
+                  <li
+                    key={fact.id}
+                    className="flex items-start gap-2 text-[#3d5945]"
+                  >
+                    <span className="mt-1 h-1.5 w-1.5 rounded-full bg-[#528762] shrink-0" />
+                    <span>
+                      <strong className="text-[#203c30]">{fact.subject}</strong>{' '}
+                      {fact.predicate}{' '}
+                      <span className="font-medium text-[#203c30]">{fact.value}</span>
+                      {fact.contextScope ? ` (${fact.contextScope})` : ''}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Generation Error Banner */}
+          {generationError && (
+            <div className="flex items-start gap-3 rounded-xl border border-[#edd6d6] bg-[#fdf4f4] p-4 text-xs text-[#8c3535]">
+              <AlertCircle size={16} className="mt-0.5 shrink-0 text-[#b33e3e]" />
+              <div>
+                <p className="font-semibold text-[#7d2c2c]">Draft Generation Notice</p>
+                <p className="mt-0.5 leading-relaxed text-[#944343]">{generationError}</p>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Generated Draft Review & Direct Editor Card */}
+      {/* Generated Output Card */}
       {generatedDraft && (
-        <div className="overflow-hidden rounded-2xl border border-[#d2ded1] bg-[#fffefc] shadow-[0_12px_36px_rgba(35,60,45,0.08)]">
-          {/* Draft Header */}
-          <div className="flex flex-wrap items-center justify-between border-b border-[#e6ebe2] bg-[#f8faf6] px-6 py-4">
+        <div className="mt-8 rounded-2xl border border-[#dce3d7] bg-[#fbfaf6]/95 shadow-sm backdrop-blur-sm overflow-hidden">
+          {/* Draft Card Header */}
+          <div className="flex items-center justify-between border-b border-[#e5ebe0] bg-[#f6f9f4]/80 px-6 py-4">
             <div className="flex items-center gap-2.5">
-              <span className="flex h-6 w-6 items-center justify-center rounded-full bg-[#e3ecdf] text-[#345941]">
-                <Sparkles size={13} />
-              </span>
+              <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#e3ecdf] text-[#345c41]">
+                <Sparkles size={14} />
+              </div>
               <div>
-                <h3 className="text-[13px] font-semibold text-[#234432]">
+                <h3 className="font-serif text-sm font-semibold text-[#203c30]">
                   Your Personalized Draft
                 </h3>
                 {generationMeta?.elapsedSec && (

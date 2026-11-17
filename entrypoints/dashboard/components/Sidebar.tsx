@@ -1,4 +1,3 @@
-
 import {
   AudioLines,
   House,
@@ -9,7 +8,12 @@ import {
   ChevronRight,
 } from 'lucide-react';
 
-type Section = 'Dashboard' | 'My Writing Data' | 'My Writing Style' | 'Settings';
+export type Section =
+  | 'Dashboard'
+  | 'My Writing Data'
+  | 'Personal Knowledge'
+  | 'My Writing Style'
+  | 'Settings';
 
 type SidebarProps = {
   activeSection: Section;
@@ -62,7 +66,9 @@ function Sidebar({ activeSection, onNavigate }: SidebarProps) {
         <nav className="space-y-1">
           {navigationItems.map(function (item) {
             const Icon = item.icon;
-            const isActive = activeSection === item.name;
+            const isActive =
+              activeSection === item.name ||
+              (item.name === 'My Writing Data' && activeSection === 'Personal Knowledge');
 
             return (
               <button

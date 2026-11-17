@@ -1,19 +1,14 @@
-
 import { useState } from 'react';
 
-import Sidebar from './components/Sidebar';
+import Sidebar, { type Section } from './components/Sidebar';
 import WelcomeSection from './components/WelcomeSection';
 import WritingComposer from './components/WritingComposer';
 import WritingData from './components/WritingData';
 import TrainingStatusCard from './components/TrainingStatusCard';
+import WritingStyleView from './components/WritingStyleView';
+import SettingsView from './components/SettingsView';
 
 import heroBackground from '../../assets/hero-background.png';
-
-type Section =
-  | 'Dashboard'
-  | 'My Writing Data'
-  | 'My Writing Style'
-  | 'Settings';
 
 function App() {
   const [activeSection, setActiveSection] = useState<Section>('Dashboard');
@@ -32,35 +27,36 @@ function App() {
     }
 
     if (activeSection === 'My Writing Data') {
-      return <WritingData />;
-    }
-
-    if (activeSection === 'My Writing Style') {
       return (
-        <section className="px-12 py-12">
-          <h1 className="font-serif text-4xl text-[#203c30]">
-            My Writing Style
-          </h1>
-          <p className="mt-2 text-sm text-[#68766d]">
-            Your personal LoRA adapter learns your natural writing voice from real message samples.
-          </p>
-          <div className="mt-8 max-w-2xl">
-            <TrainingStatusCard />
-          </div>
-        </section>
+        <WritingData
+          initialTab="messages"
+          onTabChange={(tab) =>
+            setActiveSection(tab === 'messages' ? 'My Writing Data' : 'Personal Knowledge')
+          }
+        />
       );
     }
 
-    return (
-      <section className="px-12 py-12">
-        <h1 className="font-serif text-4xl text-[#203c30]">
-          Settings
-        </h1>
-        <p className="mt-3 text-sm text-[#68766d]">
-          Your Echo preferences will be available here.
-        </p>
-      </section>
-    );
+    if (activeSection === 'Personal Knowledge') {
+      return (
+        <WritingData
+          initialTab="knowledge"
+          onTabChange={(tab) =>
+            setActiveSection(tab === 'messages' ? 'My Writing Data' : 'Personal Knowledge')
+          }
+        />
+      );
+    }
+
+    if (activeSection === 'My Writing Style') {
+      return <WritingStyleView onNavigate={setActiveSection} />;
+    }
+
+    if (activeSection === 'Settings') {
+      return <SettingsView onNavigate={setActiveSection} />;
+    }
+
+    return null;
   }
 
   return (
