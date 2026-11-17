@@ -1,3 +1,11 @@
+export type ClassificationTier =
+  | 'tier_a' // Authentic personal prose — eligible
+  | 'tier_b' // Authentic technical prose — eligible
+  | 'tier_c' // AI-agent instructions and prompt templates — segregated
+  | 'tier_d' // Terminal sessions, build logs and raw code — excluded
+  | 'tier_e' // External and third-party content — excluded
+  | 'tier_f'; // Mixed or ambiguous content — manual review
+
 export interface ContentClassification {
   contentType:
     | 'prose'
@@ -14,7 +22,57 @@ export interface ContentClassification {
   wordCount: number;
 
   reasons: string[];
+
+  // Classifier V2 Architecture enhancements
+  tier: ClassificationTier;
+  tierReason: string;
+  reasonCodes: string[];
 }
+
+export const CLASSIFICATION_REASON_CODES = {
+  // Tier A: Authentic Personal Prose
+  PERSONAL_EXPERIENCE_REFLECTION: 'personal_experience_reflection',
+  PERSONAL_WORKFLOW_HABIT: 'personal_workflow_habit',
+  PERSONAL_OPINION_OR_VALUE: 'personal_opinion_or_value',
+  PERSONAL_LEARNING_JOURNEY: 'personal_learning_journey',
+
+  // Tier B: Authentic Technical Prose
+  AUTHENTIC_TECHNICAL_EXPOSITION: 'authentic_technical_exposition',
+  NATURAL_CONVERSATIONAL_PROSE: 'natural_conversational_prose',
+
+  // Tier C: AI-Agent Directives & Prompt Templates
+  AGENT_DIRECTIVE_HEADING: 'agent_directive_heading',
+  AGENT_DIRECTIVE_COMMAND: 'agent_directive_command',
+  AGENT_STRUCTURED_TEMPLATE: 'agent_structured_template',
+
+  // Tier D: Terminal, Logs, Code, Data, Fragments
+  TERMINAL_POWERSHELL_PROMPT: 'terminal_powershell_prompt',
+  TERMINAL_WINDOWS_CMD_PROMPT: 'terminal_windows_cmd_prompt',
+  TERMINAL_POSIX_PROMPT: 'terminal_posix_prompt',
+  TERMINAL_BUILD_LOG: 'terminal_build_log',
+  TERMINAL_TEST_RUNNER_OUTPUT: 'terminal_test_runner_output',
+  TERMINAL_PACKAGE_MANAGER_OUTPUT: 'terminal_package_manager_output',
+  TERMINAL_STACK_TRACE: 'terminal_stack_trace',
+  TERMINAL_COMMAND_INVOCATION: 'terminal_command_invocation',
+  CODE_FENCED_BLOCK: 'code_fenced_block',
+  CODE_UNFENCED_DEFINITION: 'code_unfenced_definition',
+  STRUCTURED_DATA_JSON: 'structured_data_json',
+  STRUCTURED_DATA_MARKUP: 'structured_data_markup',
+  STRUCTURED_DATA_YAML: 'structured_data_yaml',
+  EMPTY_OR_WHITESPACE: 'empty_or_whitespace',
+  SHORT_FRAGMENT: 'short_fragment',
+
+  // Tier E: External & Third-Party Content
+  EXTERNAL_VIDEO_SCRIPT: 'external_video_script',
+  EXTERNAL_SOCIAL_TAGS: 'external_social_tags',
+  EXTERNAL_SCRAPED_DASHBOARD: 'external_scraped_dashboard',
+
+  // Tier F: Mixed or Ambiguous Content
+  MIXED_PROSE_AND_CODE: 'mixed_prose_and_code',
+  MIXED_PROSE_AND_TERMINAL: 'mixed_prose_and_terminal',
+  CONVERSATIONAL_QUERY_NOT_DRAFTING_TARGET: 'conversational_query_not_drafting_target',
+  AMBIGUOUS_STYLE_SIGNAL: 'ambiguous_style_signal',
+} as const;
 
 // Known command line binaries and tools
 const CLI_COMMANDS = new Set([
@@ -136,6 +194,7 @@ const NATURAL_FOLLOWING_WORDS = new Set([
   'thinking',
   'code',
   'explanation',
+  'branching',
 ]);
 
 // Short conversational phrases with minimal stylistic or informational content
@@ -178,14 +237,7 @@ const CONVERSATIONAL_FRAGMENTS = new Set([
   'please continue',
 ]);
 
-// Personal knowledge triggers organized across 6 distinct categories:
-// 1. Projects and experiences
-// 2. Learning interests and goals
-// 3. Personal habits and workflows
-// 4. Learning and communication preferences
-// 5. Personal opinions and behavioral tendencies
-// 6. Current goals, difficulties, and self-evaluations
-const PERSONAL_EXPERIENCE_PATTERNS = [
+export const PERSONAL_EXPERIENCE_PATTERNS = [
   // 1. Projects and experiences
   /\b(I|we)\b[\w\s]{0,20}\b(started by|started with|started learning|been learning|learned|learning|studying|studied|picked up|working on|working with)\b/i,
   /\b(I|we)\b[\w\s]{0,20}\b(built|building|created|creating|developed|developing|designed|designing|implemented|implementing|deployed|deploying)\b/i,
@@ -207,8 +259,8 @@ const PERSONAL_EXPERIENCE_PATTERNS = [
   /\b(my\s+way\s+of\s+explaining|how\s+I\s+explain|how\s+I\s+teach|how\s+I\s+learn|how\s+they\s+can\s+visualize|that's\s+how\s+they\s+can\s+visualize)\b/i,
   /\b(I\s+learn\s+best\s+by|I\s+prefer\s+learning|the\s+way\s+I\s+understand|helps\s+me\s+understand|helps\s+me\s+visualize)\b/i,
 
-  // 5. Personal opinions and behavioral tendencies
-  /\b(frustrates\s+me|I\s+just\s+hate|I\s+hate|I\s+really\s+like|I\s+love|I\s+prefer|I\s+value|in\s+my\s+opinion|from\s+my\s+experience|I\s+strongly\s+believe|my\s+take\s+on\s+this\s+is)\b/i,
+  // 5. Personal opinions, values and behavioral tendencies
+  /\b(frustrates\s+me|I\s+just\s+hate|I\s+hate|I\s+really\s+like|I\s+love|I\s+prefer|I\s+value|in\s+my\s+opinion|from\s+my\s+experience|I\s+strongly\s+believe|my\s+take\s+on\s+this\s+is|I\s+believe\s+good\s+software|I\s+enjoy\s+building)\b/i,
   /\b(if\s+I\s+have\s+enough\s+knowledge|if\s+I\s+know\s+enough|when\s+I\s+disagree|in\s+disagreements|I\s+will\s+argue|I\s+will\s+put\s+my\s+point|listen\s+to\s+theirs)\b/i,
   /\b(my\s+approach\s+is|my\s+tendency\s+is|my\s+philosophy\s+is|how\s+I\s+approach)\b/i,
 
@@ -217,6 +269,29 @@ const PERSONAL_EXPERIENCE_PATTERNS = [
   /\b(it's\s+not\s+(really\s+)?simple\s+to\s+come\s+up\s+with|hard\s+for\s+me\s+to|I'm\s+struggling\s+to|I\s+am\s+struggling\s+to)\b/i,
   /\b(I\s+have\s+thought\s+too\s+much\s+about|I\s+don't\s+know\s+about\s+any\s+such|I\s+am\s+not\s+satisfied|I'm\s+not\s+satisfied|I\s+feel\s+I\s+am\s+slow|I\s+feel\s+slow|people\s+my\s+age)\b/i,
   /\b(come\s+up\s+with\s+a\s+product\s+idea|looking\s+for\s+a\s+project\s+idea|thinking\s+about\s+what\s+to\s+build|trying\s+to\s+figure\s+out\s+what)\b/i,
+];
+
+export const DECLARATIVE_PERSONAL_STATEMENTS = [
+  /\b(recently\s+|so\s+)?I\s+(built|created|developed|designed|implemented|deployed|worked|interned|applied)\b/i,
+  /\bI\s+(started\s+by\s+learning|learned|studied|picked\s+up|been\s+learning)\b/i,
+  /\bI\s+(usually|always|typically|often|prefer\s+using|rely\s+on)\b/i,
+  /\b(frustrates\s+me|I\s+hate|I\s+love|I\s+value|in\s+my\s+opinion|my\s+plan\s+was|I\s+enjoy\s+building|I\s+prefer\s+software)\b/i,
+  /\bI\s+(am\s+not\s+satisfied|feel\s+I\s+am\s+slow|have\s+thought\s+too\s+much)\b/i,
+  /\bif\s+I\s+have\s+enough\s+knowledge\b/i,
+  /\bwhenever\s+i(\s+am|'m)?\s+stuck\b/i,
+  /\b(the\s+)?(main|biggest|primary)\s+(difficulty|challenge|problem)\s+(which\s+)?I\s+(faced|encountered|had)\b/i,
+  /\b(problem|difficulty|challenge)\s+(which\s+)?I\s+(faced|encountered|had)\b/i,
+  /\bI\s+(struggled\s+with|faced\s+difficulty|had\s+to\s+work\s+around|worked\s+around|experienced)\b/i,
+  /\bI\s+(couldn't|could\s+not|was\s+not\s+able\s+to|cannot|can't)\s+(get|find|use|access)\b/i,
+  /\b(so\s+)?I\s+(had\s+to\s+build|built|have\s+to\s+build)\b/i,
+];
+
+// Patterns indicative of authentic technical discussion in user voice
+const TECHNICAL_PROSE_PATTERNS = [
+  /\b(architecture|database|adapter|model|service|token|worker|offscreen|IndexedDB|LevelDB|process|pipeline|transaction|component)\b/i,
+  /\b(we\s+will\s+write\s+tests|run\s+the\s+test\s+command|code\s+will\s+run\s+against|check\s+whether\s+it\s+works|breaks\s+the\s+functionality)\b/i,
+  /\b(asynchronous\s+event-driven|connection\s+pooling|dependency\s+injection|type\s+alias|state\s+management|client-side|server-side)\b/i,
+  /\b(git\s+branching\s+strategies|deployment\s+pipeline|re-renders|microtask\s+queue|concurrency|local-first)\b/i,
 ];
 
 function isPureJson(text: string): boolean {
@@ -281,31 +356,53 @@ function isStackTraceOrCompilerLog(text: string): boolean {
   return stackTraceSignatures.some((regex) => regex.test(text));
 }
 
-function isTerminalCommand(text: string): boolean {
+/**
+ * Detects cross-platform shell prompts, PowerShell cmdlets, and terminal command invocations across lines.
+ */
+function detectTerminalPromptOrCommand(text: string): { isTerminal: boolean; reasonCode?: string } {
   const trimmed = text.trim();
-  const firstLine = trimmed.split('\n')[0]?.trim() || '';
+  const lines = trimmed.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return { isTerminal: false };
 
-  // PowerShell Cmdlets: Get-Process, Set-ExecutionPolicy, etc.
-  if (/^(Get|Set|New|Remove|Start|Stop|Invoke|Test|Enable|Disable)-[a-zA-Z]+\b/.test(firstLine)) {
-    return true;
+  // 1. Multi-platform Shell Prompts (Windows PowerShell, CMD, POSIX, Virtualenv)
+  // Checked on first line or any prompt-like line
+  const psPromptRegex = /^(PS\s+[A-Za-z]:\\|PS>)/i;
+  const cmdPromptRegex = /^[A-Za-z]:\\[^>]*>/i;
+  const posixPromptRegex = /^([$>]\s+|[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+:.*[$#]\s+|\([a-zA-Z0-9_.-]+\)\s+[a-zA-Z0-9_.-]+@|#\s+(apt|yum|systemctl|docker|npm|pnpm|yarn|git|cd|ls|rm|chmod|chown)\b)/i;
+
+  for (const line of lines) {
+    if (psPromptRegex.test(line)) {
+      return { isTerminal: true, reasonCode: CLASSIFICATION_REASON_CODES.TERMINAL_POWERSHELL_PROMPT };
+    }
+    if (cmdPromptRegex.test(line)) {
+      return { isTerminal: true, reasonCode: CLASSIFICATION_REASON_CODES.TERMINAL_WINDOWS_CMD_PROMPT };
+    }
+    if (posixPromptRegex.test(line)) {
+      return { isTerminal: true, reasonCode: CLASSIFICATION_REASON_CODES.TERMINAL_POSIX_PROMPT };
+    }
   }
 
-  // Shell prompts: $ git status, > npm install
-  if (/^[$>]\s+[a-z0-9_-]+/i.test(firstLine)) {
-    return true;
+  // 2. PowerShell Cmdlets (Get-Process, Select-Object, Where-Object, etc.)
+  const firstLine = lines[0] || '';
+  if (/^(Get|Set|New|Remove|Start|Stop|Invoke|Test|Enable|Disable|Select|Where|ForEach|Measure|Sort|Group)-[a-zA-Z]+\b/i.test(firstLine)) {
+    return { isTerminal: true, reasonCode: CLASSIFICATION_REASON_CODES.TERMINAL_POWERSHELL_PROMPT };
   }
 
+  // 3. PowerShell continuation prompt (>>)
+  if (/^\s*>>\s+/m.test(trimmed)) {
+    return { isTerminal: true, reasonCode: CLASSIFICATION_REASON_CODES.TERMINAL_POWERSHELL_PROMPT };
+  }
+
+  // 4. CLI tool commands on first line (e.g. npm install, git status)
   const tokens = firstLine.split(/\s+/);
   const firstToken = tokens[0]?.toLowerCase().replace(/[\\/].*[\\/]/, '') || '';
 
   if (CLI_COMMANDS.has(firstToken)) {
-    // If followed by natural language verb/preposition, it is prose (e.g. "Python was...", "Git is...")
     const secondToken = tokens[1]?.toLowerCase() || '';
     if (secondToken && NATURAL_FOLLOWING_WORDS.has(secondToken)) {
-      return false;
+      return { isTerminal: false };
     }
 
-    // Common terminal subcommand or flags (e.g., "npm install", "git status", "docker run -d")
     if (
       tokens.length === 1 ||
       tokens.some((token) => token.startsWith('-')) ||
@@ -313,16 +410,116 @@ function isTerminalCommand(text: string): boolean {
         secondToken
       )
     ) {
-      return true;
+      return { isTerminal: true, reasonCode: CLASSIFICATION_REASON_CODES.TERMINAL_COMMAND_INVOCATION };
     }
 
-    // Single line without terminal sentence punctuation
     if (!firstLine.endsWith('.') && !firstLine.endsWith('?') && tokens.length <= 6) {
-      return true;
+      return { isTerminal: true, reasonCode: CLASSIFICATION_REASON_CODES.TERMINAL_COMMAND_INVOCATION };
     }
   }
 
-  return false;
+  return { isTerminal: false };
+}
+
+/**
+ * Detects successful/informational build logs, package manager output, and test runner summaries.
+ */
+function detectBuildOrPackageLog(text: string): { isBuildLog: boolean; reasonCode?: string } {
+  const buildAndPackageSignatures: Array<{ pattern: RegExp; code: string }> = [
+    // Package managers (npm, pnpm, yarn)
+    { pattern: /\badded\s+\d+\s+packages(\s+in\s+\d+s)?/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_PACKAGE_MANAGER_OUTPUT },
+    { pattern: /\bpackages\s+are\s+looking\s+for\s+funding\b/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_PACKAGE_MANAGER_OUTPUT },
+    { pattern: /run\s+`npm\s+fund`\s+for\s+details/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_PACKAGE_MANAGER_OUTPUT },
+    { pattern: /\bup\s+to\s+date\s+in\s+\d+/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_PACKAGE_MANAGER_OUTPUT },
+    { pattern: /\bfound\s+\d+\s+vulnerabilities\b/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_PACKAGE_MANAGER_OUTPUT },
+    { pattern: /\baudited\s+\d+\s+packages\b/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_PACKAGE_MANAGER_OUTPUT },
+
+    // Build tools (WXT, Vite, Webpack)
+    { pattern: /\bBuilt\s+extension\s+in\s+\d+/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_BUILD_LOG },
+    { pattern: /\bBuilding\s+chrome-mv3\s+for\s+production\b/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_BUILD_LOG },
+    { pattern: /\b(WXT|vite|webpack)\s+v?\d+\.\d+/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_BUILD_LOG },
+    { pattern: /\bBuild(ing)?\s+completed\s+in\b/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_BUILD_LOG },
+    { pattern: /✓\s+\.output\//i, code: CLASSIFICATION_REASON_CODES.TERMINAL_BUILD_LOG },
+    { pattern: /Σ\s+Total\s+size:\s+[\d.]+\s+[kKmMgG]?B/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_BUILD_LOG },
+    { pattern: /[├└│─]\s+\.output[\\\/]/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_BUILD_LOG },
+    { pattern: /[├└│─]\s+[\w.-]+\.(json|html|js|css|png|svg)\s+[\d.]+\s+[kKmMgG]?B/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_BUILD_LOG },
+
+    // Test runners (Vitest, Jest)
+    { pattern: /✓\s+entrypoints\/.*tests?\s+\(\d+\)/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_TEST_RUNNER_OUTPUT },
+    { pattern: /✓\s+[\w/.-]+\.test\.ts\s+\(\d+\s+tests\)/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_TEST_RUNNER_OUTPUT },
+    { pattern: /PASS\s+Waiting\s+for\s+file\s+changes/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_TEST_RUNNER_OUTPUT },
+    { pattern: /\bTest\s+Files\s+\d+\s+passed\b/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_TEST_RUNNER_OUTPUT },
+    { pattern: /\bTests\s+\d+\s+passed\b/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_TEST_RUNNER_OUTPUT },
+    { pattern: /DEV\s+v\d+\.\d+\.\d+\s+[A-Za-z]:\//i, code: CLASSIFICATION_REASON_CODES.TERMINAL_TEST_RUNNER_OUTPUT },
+  ];
+
+  for (const sig of buildAndPackageSignatures) {
+    if (sig.pattern.test(text)) {
+      return { isBuildLog: true, reasonCode: sig.code };
+    }
+  }
+
+  return { isBuildLog: false };
+}
+
+/**
+ * Detects AI-agent directives, prompt engineering scaffolding, and audit instructions (Tier C).
+ */
+function detectAgentDirectiveOrTemplate(text: string): { isAgentPrompt: boolean; reasonCode?: string } {
+  const trimmed = text.trim();
+
+  // 1. Prominent Project / Agent Headings (e.g. "# Echo — Final Collection Resilience Review")
+  if (/^#+\s*(Echo\s*[\u2014\-]|(Task|Objective|Audit|Review|Implementation|Instructions|Requirements|Preflight|Read-Only)\b)/im.test(trimmed)) {
+    return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_DIRECTIVE_HEADING };
+  }
+
+  // 2. Directives commanding an AI assistant
+  const commandPatterns = [
+    /^(Perform\s+a\s+(strictly\s+)?(read-only|READ-ONLY|FINAL)\s+(pre-commit\s+)?(review|audit)|Prepare\s+the\s+approved\s+Echo\s+changes|Push\s+the\s+existing\s+commit|Phase\s+\d+\s+Step\s+\d+|Read-Only\s+Audit:|Review\s+the\s+following|Audit\s+the\s+implementation|Inspect\s+the\s+codebase|Verify\s+the\s+following\s+requirements|Please\s+verify\s+all|Check\s+whether\s+the\s+following)/im,
+    /\b(Strict\s+safety\s+restrictions|Required\s+output|Zero\s+training\s+steps\s+must\s+be\s+executed|Wait\s+for\s+explicit\s+approval|READ-ONLY\s+investigation\s+only|Do\s+not\s+modify\s+any\s+files|Do\s+not\s+execute\s+training|Target\s+configuration|Pre-Implementation\s+Safety\s+Audit)\b/i,
+    /^(Target|Task|Objective|Instructions|Requirements|Deliverables|Context|Verification|Pre-Implementation\s+Safety\s+Audit):\s*$/im,
+    /^I\s+approve\s+Path\s+\d+:\s+/im,
+  ];
+
+  for (const cp of commandPatterns) {
+    if (cp.test(trimmed)) {
+      return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_DIRECTIVE_COMMAND };
+    }
+  }
+
+  // 3. Multi-heading task scaffolding (## 1. ... ## 2. ...)
+  if (/(^|\n)##\s+1\.\s+[\s\S]*(^|\n)##\s+2\.\s+/im.test(trimmed)) {
+    return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_STRUCTURED_TEMPLATE };
+  }
+
+  return { isAgentPrompt: false };
+}
+
+/**
+ * Detects external, third-party, or scraped content (Tier E).
+ */
+function detectExternalContent(text: string): { isExternal: boolean; reasonCode?: string } {
+  // Video generation scripts
+  if (/\b(Video\s+\d+\s*—|Target\s+duration:\s*\d+–\d+\s+seconds|Narration:\s+Energetic|A\s+cinematic\s+Roblox-style\s+3D|A\s+high-quality\s+3D\s+animated\s+Roblox)/i.test(text)) {
+    return { isExternal: true, reasonCode: CLASSIFICATION_REASON_CODES.EXTERNAL_VIDEO_SCRIPT };
+  }
+
+  // Social gaming captions and channel descriptions
+  if (/\b(Subway\s+Surfers|Surf\s+N\s+Play|Subway\s+Surfers\s+gameplay|mobile\s+gaming|Subscribe\s+to\s+Surf\s+N\s+Play|hitting\s+300K\s+in\s+Subway\s+Surfers)\b/i.test(text)) {
+    return { isExternal: true, reasonCode: CLASSIFICATION_REASON_CODES.EXTERNAL_SOCIAL_TAGS };
+  }
+
+  // Scraped third-party interface text
+  if (/\b(Earn\s+on\s+YouTube\s+YouTube\s+Studio\s+dashboard|Channel\s+customisation\s+YouTube\s+Studio\s+dashboard|Skip\s+navigation\s+Search)\b/i.test(text)) {
+    return { isExternal: true, reasonCode: CLASSIFICATION_REASON_CODES.EXTERNAL_SCRAPED_DASHBOARD };
+  }
+
+  // Repeated hashtags
+  if (/#\w+\s+#\w+\s+#\w+/i.test(text)) {
+    return { isExternal: true, reasonCode: CLASSIFICATION_REASON_CODES.EXTERNAL_SOCIAL_TAGS };
+  }
+
+  return { isExternal: false };
 }
 
 function isUnfencedCode(text: string): boolean {
@@ -396,26 +593,27 @@ function hasMixedProseAndCode(text: string): {
     }
   }
 
-  // Check for unfenced code embedded in explanatory prose
+  // Check for unfenced code or terminal commands embedded in explanatory prose
   const lines = trimmed.split('\n').map((l) => l.trim()).filter(Boolean);
   if (lines.length >= 3) {
     let proseWordsCount = 0;
-    let hasCodeLine = false;
+    let hasCodeOrTerminalLine = false;
 
     for (const line of lines) {
       if (
         isUnfencedCode(line) ||
-        isTerminalCommand(line) ||
+        detectTerminalPromptOrCommand(line).isTerminal ||
+        detectBuildOrPackageLog(line).isBuildLog ||
         isStackTraceOrCompilerLog(line)
       ) {
-        hasCodeLine = true;
+        hasCodeOrTerminalLine = true;
       } else {
         const words = line.split(/\s+/).filter(Boolean);
         proseWordsCount += words.length;
       }
     }
 
-    if (hasCodeLine && proseWordsCount >= 10) {
+    if (hasCodeOrTerminalLine && proseWordsCount >= 10) {
       return { isMixed: true, proseWords: proseWordsCount };
     }
   }
@@ -432,21 +630,6 @@ const PROCEDURAL_QUESTION_PATTERNS = [
   /\bok\s+then\s+we\s+can\s+go\s+with\b/i,
 ];
 
-export const DECLARATIVE_PERSONAL_STATEMENTS = [
-  /\b(recently\s+|so\s+)?I\s+(built|created|developed|designed|implemented|deployed|worked|interned|applied)\b/i,
-  /\bI\s+(started\s+by\s+learning|learned|studied|picked\s+up|been\s+learning)\b/i,
-  /\bI\s+(usually|always|typically|often|prefer\s+using|rely\s+on)\b/i,
-  /\b(frustrates\s+me|I\s+hate|I\s+love|I\s+value|in\s+my\s+opinion|my\s+plan\s+was)\b/i,
-  /\bI\s+(am\s+not\s+satisfied|feel\s+I\s+am\s+slow|have\s+thought\s+too\s+much)\b/i,
-  /\bif\s+I\s+have\s+enough\s+knowledge\b/i,
-  /\bwhenever\s+i(\s+am|'m)?\s+stuck\b/i,
-  /\b(the\s+)?(main|biggest|primary)\s+(difficulty|challenge|problem)\s+(which\s+)?I\s+(faced|encountered|had)\b/i,
-  /\b(problem|difficulty|challenge)\s+(which\s+)?I\s+(faced|encountered|had)\b/i,
-  /\bI\s+(struggled\s+with|faced\s+difficulty|had\s+to\s+work\s+around|worked\s+around|experienced)\b/i,
-  /\bI\s+(couldn't|could\s+not|was\s+not\s+able\s+to|cannot|can't)\s+(get|find|use|access)\b/i,
-  /\b(so\s+)?I\s+(had\s+to\s+build|built|have\s+to\s+build)\b/i,
-];
-
 function isProceduralQuestionOnly(text: string): boolean {
   const matchesProcedural = PROCEDURAL_QUESTION_PATTERNS.some((pattern) => pattern.test(text));
   if (!matchesProcedural) {
@@ -454,6 +637,19 @@ function isProceduralQuestionOnly(text: string): boolean {
   }
   const hasDeclarativeFact = DECLARATIVE_PERSONAL_STATEMENTS.some((pattern) => pattern.test(text));
   return !hasDeclarativeFact;
+}
+
+function isConversationalQuestion(text: string): boolean {
+  const trimmed = text.trim();
+  if (isProceduralQuestionOnly(trimmed)) {
+    return true;
+  }
+  if (trimmed.endsWith('?')) {
+    // If it ends with ? and lacks personal declarative facts, it is a conversational query turn
+    const hasDeclarativeFact = DECLARATIVE_PERSONAL_STATEMENTS.some((pattern) => pattern.test(trimmed));
+    return !hasDeclarativeFact;
+  }
+  return false;
 }
 
 function hasPersonalKnowledgeSignal(text: string): boolean {
@@ -464,15 +660,21 @@ function hasPersonalKnowledgeSignal(text: string): boolean {
 }
 
 /**
- * Classifies a captured writing message to evaluate content type,
- * writing-style signal, and personal knowledge potential without modifying data.
+ * Classifies a captured writing message into the six-tier architecture:
+ * Tier A: Authentic personal prose (eligible)
+ * Tier B: Authentic technical prose (eligible)
+ * Tier C: AI-agent instructions & prompt templates (segregated)
+ * Tier D: Terminal sessions, build logs, raw code & structured data (excluded)
+ * Tier E: External & third-party content (excluded)
+ * Tier F: Mixed or ambiguous content (manual review)
  */
 export function classifyContent(text: string): ContentClassification {
   const normalizedText = text.trim();
   const wordCount = normalizedText ? normalizedText.split(/\s+/).length : 0;
   const reasons: string[] = [];
+  const reasonCodes: string[] = [];
 
-  // 1. Empty / Whitespace-only
+  // 1. Empty / Whitespace-only -> Tier D (Excluded)
   if (!normalizedText || wordCount === 0) {
     return {
       contentType: 'short_fragment',
@@ -480,10 +682,13 @@ export function classifyContent(text: string): ContentClassification {
       knowledgeSignal: 'none',
       wordCount: 0,
       reasons: ['empty_message'],
+      tier: 'tier_d',
+      tierReason: 'Empty or whitespace message',
+      reasonCodes: [CLASSIFICATION_REASON_CODES.EMPTY_OR_WHITESPACE],
     };
   }
 
-  // 2. Structured data (JSON, XML/HTML, YAML)
+  // 2. Structured data (JSON, XML/HTML, YAML) -> Tier D (Excluded)
   if (isPureJson(normalizedText)) {
     return {
       contentType: 'structured_data',
@@ -491,6 +696,9 @@ export function classifyContent(text: string): ContentClassification {
       knowledgeSignal: 'none',
       wordCount,
       reasons: ['json_payload'],
+      tier: 'tier_d',
+      tierReason: 'Structured JSON payload',
+      reasonCodes: [CLASSIFICATION_REASON_CODES.STRUCTURED_DATA_JSON],
     };
   }
 
@@ -501,6 +709,9 @@ export function classifyContent(text: string): ContentClassification {
       knowledgeSignal: 'none',
       wordCount,
       reasons: ['xml_or_html_markup'],
+      tier: 'tier_d',
+      tierReason: 'XML or HTML markup',
+      reasonCodes: [CLASSIFICATION_REASON_CODES.STRUCTURED_DATA_MARKUP],
     };
   }
 
@@ -511,10 +722,13 @@ export function classifyContent(text: string): ContentClassification {
       knowledgeSignal: 'none',
       wordCount,
       reasons: ['yaml_or_configuration_data'],
+      tier: 'tier_d',
+      tierReason: 'YAML or configuration data',
+      reasonCodes: [CLASSIFICATION_REASON_CODES.STRUCTURED_DATA_YAML],
     };
   }
 
-  // 3. Stack traces & compiler error logs
+  // 3. Stack traces & compiler error logs -> Tier D (Excluded)
   if (isStackTraceOrCompilerLog(normalizedText)) {
     return {
       contentType: 'terminal',
@@ -522,10 +736,61 @@ export function classifyContent(text: string): ContentClassification {
       knowledgeSignal: 'none',
       wordCount,
       reasons: ['stack_trace_or_compiler_output'],
+      tier: 'tier_d',
+      tierReason: 'Stack trace or compiler error log',
+      reasonCodes: [CLASSIFICATION_REASON_CODES.TERMINAL_STACK_TRACE],
     };
   }
 
-  // 4. Entirely fenced code block (``` ... ```)
+  // 4. Build, package manager, and test runner outputs -> Tier D (Excluded)
+  const buildLogCheck = detectBuildOrPackageLog(normalizedText);
+  if (buildLogCheck.isBuildLog) {
+    const code = buildLogCheck.reasonCode || CLASSIFICATION_REASON_CODES.TERMINAL_BUILD_LOG;
+    return {
+      contentType: 'terminal',
+      styleSignal: 'none',
+      knowledgeSignal: 'none',
+      wordCount,
+      reasons: ['build_or_package_manager_log'],
+      tier: 'tier_d',
+      tierReason: 'Build log, package manager output, or test runner summary',
+      reasonCodes: [code],
+    };
+  }
+
+  // 5. AI-Agent Directives & Prompt Templates -> Tier C (Segregated)
+  const agentCheck = detectAgentDirectiveOrTemplate(normalizedText);
+  if (agentCheck.isAgentPrompt) {
+    const code = agentCheck.reasonCode || CLASSIFICATION_REASON_CODES.AGENT_DIRECTIVE_COMMAND;
+    return {
+      contentType: 'prose',
+      styleSignal: 'none',
+      knowledgeSignal: 'none',
+      wordCount,
+      reasons: ['agent_directive_or_prompt_template'],
+      tier: 'tier_c',
+      tierReason: 'AI-agent instruction, audit directive, or prompt template',
+      reasonCodes: [code],
+    };
+  }
+
+  // 6. Cross-platform terminal shell prompts & commands -> Tier D (Excluded)
+  const terminalCheck = detectTerminalPromptOrCommand(normalizedText);
+  if (terminalCheck.isTerminal) {
+    const code = terminalCheck.reasonCode || CLASSIFICATION_REASON_CODES.TERMINAL_COMMAND_INVOCATION;
+    return {
+      contentType: 'terminal',
+      styleSignal: 'none',
+      knowledgeSignal: 'none',
+      wordCount,
+      reasons: ['terminal_command', 'terminal_command_or_prompt'],
+      tier: 'tier_d',
+      tierReason: 'Cross-platform terminal prompt or command invocation',
+      reasonCodes: [code],
+    };
+  }
+
+  // 7. Entirely fenced code block (``` ... ```) -> Tier D (Excluded)
   if (/^```[\s\S]*```$/.test(normalizedText)) {
     return {
       contentType: 'code',
@@ -533,31 +798,51 @@ export function classifyContent(text: string): ContentClassification {
       knowledgeSignal: 'none',
       wordCount,
       reasons: ['fenced_code_block'],
+      tier: 'tier_d',
+      tierReason: 'Markdown fenced code block',
+      reasonCodes: [CLASSIFICATION_REASON_CODES.CODE_FENCED_BLOCK],
     };
   }
 
-  // 5. Mixed prose and code / commands
+  // 8. External / Third-Party Content -> Tier E (Excluded)
+  const externalCheck = detectExternalContent(normalizedText);
+  if (externalCheck.isExternal) {
+    const code = externalCheck.reasonCode || CLASSIFICATION_REASON_CODES.EXTERNAL_SOCIAL_TAGS;
+    return {
+      contentType: 'prose',
+      styleSignal: 'none',
+      knowledgeSignal: 'none',
+      wordCount,
+      reasons: ['external_or_third_party_content'],
+      tier: 'tier_e',
+      tierReason: 'External video generation prompt, social tags, or scraped interface content',
+      reasonCodes: [code],
+    };
+  }
+
+  // 9. Mixed prose and code / terminal -> Tier F (Manual Review)
   const mixedCheck = hasMixedProseAndCode(normalizedText);
   if (mixedCheck.isMixed) {
     reasons.push('mixed_prose_and_code');
+    reasonCodes.push(CLASSIFICATION_REASON_CODES.MIXED_PROSE_AND_CODE);
     const isKnowledge = hasPersonalKnowledgeSignal(normalizedText);
     if (isKnowledge) {
       reasons.push('personal_context_detected');
     }
 
-    const styleSignal =
-      mixedCheck.proseWords >= 14 ? 'strong' : mixedCheck.proseWords >= 6 ? 'weak' : 'none';
-
     return {
       contentType: 'mixed',
-      styleSignal,
+      styleSignal: mixedCheck.proseWords >= 14 ? 'strong' : 'weak',
       knowledgeSignal: isKnowledge ? 'possible' : 'none',
       wordCount,
       reasons,
+      tier: 'tier_f',
+      tierReason: 'Mixed prose and code/terminal requiring manual review',
+      reasonCodes,
     };
   }
 
-  // 6. Unfenced source code
+  // 10. Raw Unfenced source code -> Tier D (Excluded)
   if (isUnfencedCode(normalizedText)) {
     return {
       contentType: 'code',
@@ -565,21 +850,13 @@ export function classifyContent(text: string): ContentClassification {
       knowledgeSignal: 'none',
       wordCount,
       reasons: ['unfenced_source_code'],
+      tier: 'tier_d',
+      tierReason: 'Raw unfenced source code',
+      reasonCodes: [CLASSIFICATION_REASON_CODES.CODE_UNFENCED_DEFINITION],
     };
   }
 
-  // 7. Terminal command
-  if (isTerminalCommand(normalizedText)) {
-    return {
-      contentType: 'terminal',
-      styleSignal: 'none',
-      knowledgeSignal: 'none',
-      wordCount,
-      reasons: ['terminal_command'],
-    };
-  }
-
-  // 8. Short conversational fragments (evaluated after code, terminal, and structured data)
+  // 11. Short conversational fragments (< 4 words or static phrases) -> Tier D (Excluded)
   const lowerText = normalizedText.toLowerCase().replace(/[.!?,]$/, '');
   if (
     CONVERSATIONAL_FRAGMENTS.has(lowerText) ||
@@ -592,33 +869,99 @@ export function classifyContent(text: string): ContentClassification {
         knowledgeSignal: 'none',
         wordCount,
         reasons: ['conversational_fragment'],
+        tier: 'tier_d',
+        tierReason: 'Short conversational fragment without style signal',
+        reasonCodes: [CLASSIFICATION_REASON_CODES.SHORT_FRAGMENT],
       };
     }
   }
 
-  // 9. Natural language prose
-  reasons.push('natural_language_prose');
+  // 12. Conversational Questions (e.g. asking an AI questions) -> Tier F (Manual Review / Non-drafting)
+  if (isConversationalQuestion(normalizedText)) {
+    reasons.push('conversational_query');
+    reasonCodes.push(CLASSIFICATION_REASON_CODES.CONVERSATIONAL_QUERY_NOT_DRAFTING_TARGET);
+    return {
+      contentType: 'prose',
+      styleSignal: 'weak',
+      knowledgeSignal: 'none',
+      wordCount,
+      reasons,
+      tier: 'tier_f',
+      tierReason: 'Conversational question directed at assistant; not self-contained drafting prose',
+      reasonCodes,
+    };
+  }
+
+  // 13. Natural Language Prose Evaluation (Tier A vs Tier B)
   const isPersonalKnowledge = hasPersonalKnowledgeSignal(normalizedText);
   if (isPersonalKnowledge) {
     reasons.push('personal_context_detected');
   }
 
-  // Style signal evaluation:
-  // 14+ words of prose provides solid sentence flow/cadence; 6-13 words with personal/emotional context also provides style signal.
-  let styleSignal: 'strong' | 'weak' | 'none';
-  if (wordCount >= 14) {
-    styleSignal = 'strong';
-  } else if (wordCount >= 6) {
-    styleSignal = isPersonalKnowledge ? 'strong' : 'weak';
-  } else {
-    styleSignal = 'weak';
+  // Check for Tier A (Authentic Personal Prose)
+  const hasPersonalStatement = DECLARATIVE_PERSONAL_STATEMENTS.some((p) => p.test(normalizedText));
+
+  if (!isProceduralQuestionOnly(normalizedText) && (isPersonalKnowledge || hasPersonalStatement)) {
+    reasons.push('natural_language_prose');
+    reasonCodes.push(CLASSIFICATION_REASON_CODES.PERSONAL_EXPERIENCE_REFLECTION);
+    return {
+      contentType: 'prose',
+      styleSignal: 'strong',
+      knowledgeSignal: 'possible',
+      wordCount,
+      reasons,
+      tier: 'tier_a',
+      tierReason: 'Authentic personal prose with genuine style and experiential signal',
+      reasonCodes,
+    };
   }
 
+  // Check for Tier B (Authentic Technical Prose)
+  const isTechnicalProse = TECHNICAL_PROSE_PATTERNS.some((p) => p.test(normalizedText));
+  if (isTechnicalProse && wordCount >= 14) {
+    reasons.push('natural_language_prose');
+    reasons.push('technical_exposition');
+    reasonCodes.push(CLASSIFICATION_REASON_CODES.AUTHENTIC_TECHNICAL_EXPOSITION);
+    return {
+      contentType: 'prose',
+      styleSignal: 'strong',
+      knowledgeSignal: 'none',
+      wordCount,
+      reasons,
+      tier: 'tier_b',
+      tierReason: 'Authentic technical prose explaining concepts, tests, or architecture',
+      reasonCodes,
+    };
+  }
+
+  // General prose check
+  if (wordCount >= 16 && /[.!?]$/.test(normalizedText)) {
+    // Complete grammatical sentence structure
+    reasons.push('natural_language_prose');
+    reasonCodes.push(CLASSIFICATION_REASON_CODES.NATURAL_CONVERSATIONAL_PROSE);
+    return {
+      contentType: 'prose',
+      styleSignal: 'strong',
+      knowledgeSignal: 'none',
+      wordCount,
+      reasons,
+      tier: 'tier_b',
+      tierReason: 'Authentic grammatical conversational prose',
+      reasonCodes,
+    };
+  }
+
+  // Ambiguous or weak style prose -> Tier F (Manual Review)
+  reasons.push('natural_language_prose');
+  reasonCodes.push(CLASSIFICATION_REASON_CODES.AMBIGUOUS_STYLE_SIGNAL);
   return {
     contentType: 'prose',
-    styleSignal,
-    knowledgeSignal: isPersonalKnowledge ? 'possible' : 'none',
+    styleSignal: 'weak',
+    knowledgeSignal: 'none',
     wordCount,
     reasons,
+    tier: 'tier_f',
+    tierReason: 'Ambiguous or weak style signal requiring manual review',
+    reasonCodes,
   };
 }

@@ -12,9 +12,18 @@ function isObviousNonContent(text: string): boolean {
     return true;
   }
 
+  // Reject shell prompts (PowerShell, Windows, POSIX)
+  if (
+    /^(PS\s+[A-Za-z]:\\|[A-Za-z]:\\[^>]*>|PS>|[$#>]\s+|[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+:)/i.test(
+      normalizedText
+    )
+  ) {
+    return true;
+  }
+
   // Reject obvious terminal commands.
   const terminalCommandPattern =
-    /^(npm|npx|node|python|python3|pip|pip3|git|docker|cd|mkdir|rmdir|del|dir|ls|pwd|clear|cls|ollama|wsl)\b/i;
+    /^(npm|npx|pnpm|yarn|bun|node|python|python3|pip|pip3|git|docker|cd|mkdir|rmdir|del|dir|ls|pwd|clear|cls|ollama|wsl|cargo|go)\b/i;
 
   if (terminalCommandPattern.test(normalizedText)) {
     return true;
@@ -38,22 +47,10 @@ function isEligibleTrainingSample(text: string): boolean {
 
   const classification = classifyContent(text);
 
-  // Exclude code, terminal output, structured data, and short fragments
-  if (
-    classification.contentType === 'code' ||
-    classification.contentType === 'terminal' ||
-    classification.contentType === 'structured_data' ||
-    classification.contentType === 'short_fragment'
-  ) {
-    return false;
-  }
-
-  // Exclude weak or no-style samples according to existing rules
-  if (classification.styleSignal !== 'strong') {
-    return false;
-  }
-
-  return true;
+  // V2 Six-Tier Architecture:
+  // ONLY Tier A (Authentic personal prose) and Tier B (Authentic technical prose) are eligible for style SFT.
+  // Tier C (Agent directives), Tier D (Terminal/code), Tier E (External), and Tier F (Mixed/ambiguous) are excluded.
+  return classification.tier === 'tier_a' || classification.tier === 'tier_b';
 }
 
 export {

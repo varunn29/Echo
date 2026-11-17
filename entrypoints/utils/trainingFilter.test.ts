@@ -57,7 +57,7 @@ describe('isEligibleTrainingSample', function () {
     expect(isEligibleTrainingSample(text)).toBe(true);
   });
 
-  it('should accept mixed prose and code when prose provides strong style signal', function () {
+  it('should quarantine mixed prose and code into Tier F (not eligible for training)', function () {
     const text = `I am trying to implement a debounce hook in React, but the timer keeps resetting on each render:
 
 \`\`\`tsx
@@ -71,7 +71,7 @@ function useDebounce(value, delay) {
 
 How can I persist the timer reference across re-renders without triggering extra updates?`;
 
-    expect(isEligibleTrainingSample(text)).toBe(true);
+    expect(isEligibleTrainingSample(text)).toBe(false);
   });
 
   it('should reject empty or whitespace text', function () {
@@ -114,6 +114,43 @@ How can I persist the timer reference across re-renders without triggering extra
 
     // 9 words generic prose without personal context
     expect(isEligibleTrainingSample('The quick brown fox jumps over the lazy dog.')).toBe(false);
+  });
+
+  it('should accept authentic technical prose with strong style signal (Tier B)', function () {
+    const text =
+      'When designing an event-driven architecture, separating the command bus from query handlers prevents race conditions and makes testing individual state mutations predictable.';
+
+    expect(isEligibleTrainingSample(text)).toBe(true);
+  });
+
+  it('should reject Windows PowerShell prompts and drive prefixes', function () {
+    expect(isEligibleTrainingSample('PS D:\\Forge\\Echo> npm run build')).toBe(false);
+    expect(isEligibleTrainingSample('D:\\Forge\\Echo> git status')).toBe(false);
+  });
+
+  it('should reject AI-agent directives and prompt scaffolding (Tier C)', function () {
+    expect(
+      isEligibleTrainingSample(
+        '# Echo — Final Training Readiness Audit\n\nPerform a strictly read-only audit of the codebase and verify the following.'
+      )
+    ).toBe(false);
+  });
+
+  it('should reject build logs and package manager outputs (Tier D)', function () {
+    const buildLog = `wxt v0.19.0 (vite v5.1.0)
+Building for chrome (manifest v3)...
+✓ .output/chrome-mv3/manifest.json
+✓ .output/chrome-mv3/background.js
+Build completed in 2.3s`;
+
+    expect(isEligibleTrainingSample(buildLog)).toBe(false);
+  });
+
+  it('should reject external video generation and scraped social content (Tier E)', function () {
+    const script =
+      'Video 001 — Target duration: 30–45 seconds. A cinematic Roblox-style 3D avatar running through a futuristic neon city.';
+
+    expect(isEligibleTrainingSample(script)).toBe(false);
   });
 
   it('should reject mixed prose and code when prose signal is weak', function () {

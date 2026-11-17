@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classifyContent } from './contentClassifier';
+import { classifyContent, CLASSIFICATION_REASON_CODES } from './contentClassifier';
 
 describe('ContentClassifier V1 Test Suite', function () {
   describe('1. Natural Prose Beginning with Technology Names (Bug Fixes)', function () {
@@ -586,6 +586,228 @@ How can I persist the timer reference across re-renders without triggering extra
       expect(result.contentType).toBe('prose');
       expect(result.knowledgeSignal).toBe('none');
       expect(result.reasons).not.toContain('personal_context_detected');
+    });
+  });
+
+  describe('13. Classifier V2 Six-Tier Architecture & Edge Cases', function () {
+    describe('Tier A: Authentic Personal Prose', function () {
+      it('should classify personal learning journey into Tier A', function () {
+        const text =
+          'I started learning web development by building simple UI widgets and now I prefer TypeScript with React for larger fullstack projects.';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_a');
+        expect(result.styleSignal).toBe('strong');
+        expect(result.knowledgeSignal).toBe('possible');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.PERSONAL_EXPERIENCE_REFLECTION);
+      });
+
+      it('should classify personal architectural philosophy into Tier A', function () {
+        const text =
+          'I value software that behaves consistently and handles unexpected situations gracefully. A reliable application should not lose user data just because an external service is temporarily unavailable.';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_a');
+        expect(result.styleSignal).toBe('strong');
+      });
+
+      it('should preserve Tier A when personal struggle is followed by a closing question', function () {
+        const text =
+          'The difficulty I faced while building the analytics platform was not being able to get live feed data, so I had to build a static simulation. Should we keep this fallback active for offline testing?';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_a');
+        expect(result.knowledgeSignal).toBe('possible');
+      });
+    });
+
+    describe('Tier B: Authentic Technical Prose', function () {
+      it('should classify technical explanation into Tier B', function () {
+        const text =
+          'When designing an event-driven architecture, separating the command bus from query handlers prevents race conditions and makes testing individual state mutations predictable.';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_b');
+        expect(result.styleSignal).toBe('strong');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.AUTHENTIC_TECHNICAL_EXPOSITION);
+      });
+
+      it('should classify detailed unit testing philosophy into Tier B', function () {
+        const text =
+          'Unit tests should focus on boundary conditions and invariant enforcement rather than asserting mock implementation details that create fragile test suites.';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_b');
+        expect(result.styleSignal).toBe('strong');
+      });
+    });
+
+    describe('Tier C: AI-Agent Directives and Templates', function () {
+      it('should classify markdown agent heading into Tier C', function () {
+        const text =
+          '# Echo — Final Training Readiness Audit\n\nPerform a strictly read-only audit of the codebase and verify the following requirements.';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_c');
+        expect(result.styleSignal).toBe('none');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.AGENT_DIRECTIVE_HEADING);
+      });
+
+      it('should classify agent command directive into Tier C', function () {
+        const text =
+          'Perform a strictly read-only pre-commit review of the active workspace. Zero training steps must be executed.';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_c');
+        expect(result.styleSignal).toBe('none');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.AGENT_DIRECTIVE_COMMAND);
+      });
+
+      it('should classify structured prompt template into Tier C', function () {
+        const text =
+          '## 1. Requirements\nCheck the dataset.\n\n## 2. Deliverables\nProduce an audit summary.';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_c');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.AGENT_STRUCTURED_TEMPLATE);
+      });
+    });
+
+    describe('Tier D: Terminal Sessions, Build Logs, Raw Code & Structured Data', function () {
+      it('should classify Windows PowerShell prompt into Tier D', function () {
+        const result = classifyContent('PS D:\\Forge\\Echo> npm run build');
+        expect(result.tier).toBe('tier_d');
+        expect(result.contentType).toBe('terminal');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.TERMINAL_POWERSHELL_PROMPT);
+      });
+
+      it('should classify Windows CMD drive prompt into Tier D', function () {
+        const result = classifyContent('D:\\Forge\\Echo> git status');
+        expect(result.tier).toBe('tier_d');
+        expect(result.contentType).toBe('terminal');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.TERMINAL_WINDOWS_CMD_PROMPT);
+      });
+
+      it('should classify POSIX terminal prompt into Tier D', function () {
+        const result = classifyContent('user@devbox:~/projects$ docker compose up -d');
+        expect(result.tier).toBe('tier_d');
+        expect(result.contentType).toBe('terminal');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.TERMINAL_POSIX_PROMPT);
+      });
+
+      it('should classify package manager install log into Tier D', function () {
+        const log = 'added 14 packages, and audited 184 packages in 1.4s\n3 packages are looking for funding';
+        const result = classifyContent(log);
+        expect(result.tier).toBe('tier_d');
+        expect(result.contentType).toBe('terminal');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.TERMINAL_PACKAGE_MANAGER_OUTPUT);
+      });
+
+      it('should classify WXT/Vite build summary into Tier D', function () {
+        const buildSummary = 'wxt v0.19.0 (vite v5.1.0)\n✓ .output/chrome-mv3/manifest.json\nBuild completed in 3.1s';
+        const result = classifyContent(buildSummary);
+        expect(result.tier).toBe('tier_d');
+        expect(result.contentType).toBe('terminal');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.TERMINAL_BUILD_LOG);
+      });
+
+      it('should classify Vitest test runner summary into Tier D', function () {
+        const vitestLog = '✓ entrypoints/utils/trainingFilter.test.ts (23 tests) 18ms\n Test Files  1 passed (1)';
+        const result = classifyContent(vitestLog);
+        expect(result.tier).toBe('tier_d');
+        expect(result.contentType).toBe('terminal');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.TERMINAL_TEST_RUNNER_OUTPUT);
+      });
+
+      it('should classify pure fenced code block into Tier D', function () {
+        const code = '```typescript\nconst greeting = "hello";\nconsole.log(greeting);\n```';
+        const result = classifyContent(code);
+        expect(result.tier).toBe('tier_d');
+        expect(result.contentType).toBe('code');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.CODE_FENCED_BLOCK);
+      });
+
+      it('should classify raw unfenced code into Tier D', function () {
+        const code = 'function calculateTotal(items: CartItem[]): number {\n  return items.reduce((sum, item) => sum + item.price, 0);\n}';
+        const result = classifyContent(code);
+        expect(result.tier).toBe('tier_d');
+        expect(result.contentType).toBe('code');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.CODE_UNFENCED_DEFINITION);
+      });
+    });
+
+    describe('Tier E: External and Third-Party Content', function () {
+      it('should classify video generation script into Tier E', function () {
+        const text =
+          'Video 001 — Target duration: 30–45 seconds. A cinematic Roblox-style 3D avatar jumping across rooftops.';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_e');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.EXTERNAL_VIDEO_SCRIPT);
+      });
+
+      it('should classify social gaming tags and descriptions into Tier E', function () {
+        const text =
+          'Hitting 300K in Subway Surfers gameplay! Subscribe to Surf N Play for more daily mobile gaming clips #gaming';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_e');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.EXTERNAL_SOCIAL_TAGS);
+      });
+
+      it('should classify scraped YouTube Studio dashboard into Tier E', function () {
+        const text =
+          'Channel customisation YouTube Studio dashboard Skip navigation Search';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_e');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.EXTERNAL_SCRAPED_DASHBOARD);
+      });
+    });
+
+    describe('Tier F: Mixed or Ambiguous Content (Manual Review)', function () {
+      it('should classify mixed prose and code into Tier F', function () {
+        const text = `I am trying to implement a debounce hook in React, but the timer keeps resetting on each render:
+
+\`\`\`tsx
+function useDebounce(value, delay) {
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+}
+\`\`\`
+
+How can I persist the timer reference across re-renders without triggering extra updates?`;
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_f');
+        expect(result.contentType).toBe('mixed');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.MIXED_PROSE_AND_CODE);
+      });
+
+      it('should classify conversational question into Tier F', function () {
+        const text = 'Can you help me understand why this database query is slow?';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_f');
+        expect(result.styleSignal).toBe('weak');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.CONVERSATIONAL_QUERY_NOT_DRAFTING_TARGET);
+      });
+
+      it('should classify short/ambiguous prose into Tier F', function () {
+        const text = 'This seems like a reasonable approach.';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_f');
+        expect(result.styleSignal).toBe('weak');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.AMBIGUOUS_STYLE_SIGNAL);
+      });
+    });
+
+    describe('False Positive & False Negative Boundary Checks', function () {
+      it('should NOT misclassify technical prose starting with "Docker" or "Git" as terminal command', function () {
+        const text =
+          'Docker makes our deployment pipeline predictable and isolated across environments when teams share staging servers.';
+        const result = classifyContent(text);
+        expect(result.contentType).toBe('prose');
+        expect(result.tier).not.toBe('tier_d');
+      });
+
+      it('should NOT allow a long message with an agent directive to default to Tier A or B', function () {
+        const text =
+          '# Echo — Final Training Readiness Audit\n\n' +
+          'Perform a strictly read-only audit of the entire codebase. Check all files, verify tests, and summarize findings in an artifact. Ensure zero training execution.';
+        const result = classifyContent(text);
+        expect(result.tier).toBe('tier_c');
+        expect(result.styleSignal).toBe('none');
+      });
     });
   });
 });
