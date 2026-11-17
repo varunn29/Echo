@@ -17,13 +17,14 @@ describe('Echo Generation Service Client', () => {
   });
 
   describe('checkGenerationServiceHealth', () => {
-    it('returns ready status when service returns HTTP 200 with status ready', async () => {
+    it('returns ready status when service returns HTTP 200 with status ready and parses adapterVersion', async () => {
       global.fetch = vi.fn().mockResolvedValue({
         status: 200,
         json: async () => ({
           status: 'ready',
           model: 'Qwen/Qwen3.5-0.8B-Base',
-          adapter: 'training-output/qwen3.5-0.8b-lora-v2',
+          adapter: 'training-output/qwen3.5-0.8b-lora-v5',
+          adapterVersion: 'v5',
           loadTimeSec: 2.76,
           residentRamMb: 3600.0,
           uptimeSec: 45.2,
@@ -35,7 +36,8 @@ describe('Echo Generation Service Client', () => {
       expect(health.isModelReady).toBe(true);
       expect(health.status).toBe('ready');
       expect(health.model).toBe('Qwen/Qwen3.5-0.8B-Base');
-      expect(health.adapter).toBe('training-output/qwen3.5-0.8b-lora-v2');
+      expect(health.adapter).toBe('training-output/qwen3.5-0.8b-lora-v5');
+      expect(health.adapterVersion).toBe('v5');
       expect(health.loadTimeSec).toBe(2.76);
     });
 
@@ -280,6 +282,33 @@ describe('Echo Generation Service Client', () => {
       await expect(
         generatePersonalizedDraft({ topic: 'Test topic' })
       ).rejects.toThrow('unparseable response');
+    });
+
+    it('throws error when server returns an empty or whitespace-only draft', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        status: 200,
+        json: async () => ({
+          completeDraft: '   \n  ',
+          generatedText: '',
+        }),
+      } as Response);
+
+      await expect(
+        generatePersonalizedDraft({ topic: 'Valid topic' })
+      ).rejects.toThrow('Generation service returned an empty draft');
+    });
+
+    it('throws error when server returns response missing completeDraft property', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        status: 200,
+        json: async () => ({
+          generatedText: 'Some text but no completeDraft',
+        }),
+      } as Response);
+
+      await expect(
+        generatePersonalizedDraft({ topic: 'Valid topic' })
+      ).rejects.toThrow('Invalid response structure: missing complete draft');
     });
 
     it('throws error when generation request times out', async () => {

@@ -9,6 +9,7 @@ export interface GenerationServiceHealth {
   status: 'ready' | 'loading' | 'offline' | 'error';
   model?: string;
   adapter?: string;
+  adapterVersion?: string;
   loadTimeSec?: number;
   residentRamMb?: number;
   uptimeSec?: number;
@@ -80,7 +81,7 @@ export interface GenerationClientOptions {
 }
 
 export const DEFAULT_GENERATION_SERVICE_URL = 'http://127.0.0.1:11435';
-export const DEFAULT_GENERATION_TIMEOUT_MS = 60000; // 60s for CPU inference
+export const DEFAULT_GENERATION_TIMEOUT_MS = 90000; // 90s for CPU inference
 export const DEFAULT_HEALTH_TIMEOUT_MS = 3000; // 3s for health checks
 
 /**
@@ -104,12 +105,18 @@ export async function checkGenerationServiceHealth(
 
     if (res.status === 200) {
       const data = await res.json();
+      const rawVersion =
+        typeof data.adapterVersion === 'string' && data.adapterVersion.trim()
+          ? data.adapterVersion.trim()
+          : undefined;
+
       return {
         isOnline: true,
         isModelReady: data.status === 'ready',
         status: data.status === 'ready' ? 'ready' : 'loading',
         model: data.model,
         adapter: data.adapter,
+        adapterVersion: rawVersion,
         loadTimeSec: data.loadTimeSec,
         residentRamMb: data.residentRamMb,
         uptimeSec: data.uptimeSec,
@@ -230,6 +237,10 @@ export async function generatePersonalizedDraft(
         throw new Error('Invalid response structure: missing complete draft.');
       }
 
+      if (!data.completeDraft.trim()) {
+        throw new Error('Generation service returned an empty draft. Please try adjusting your prompt or topic.');
+      }
+
       return {
         completeDraft: data.completeDraft,
         generatedText: data.generatedText ?? '',
@@ -277,7 +288,7 @@ export async function generatePersonalizedDraft(
   } catch (err: unknown) {
     if (err instanceof Error) {
       if (err.name === 'AbortError') {
-        throw new Error('Generation request timed out. The local model took too long to respond.');
+        throw new Error('Generation request timed out. Local CPU inference took longer than 90 seconds. Try shortening the prompt or reducing personal knowledge facts.');
       }
       throw err;
     }

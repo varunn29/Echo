@@ -611,18 +611,21 @@ def build_grounded_fallback_draft(
     # Case 1: Match Point with static data limitation
     is_match_point = "match point" in topic_lower or "betting platform" in topic_lower or "tennis" in topic_lower
     if is_match_point and any("static" in k.lower() or "simulat" in k.lower() for k in personal_knowledge):
+        has_tennis = any("tennis" in k.lower() for k in personal_knowledge) or "tennis" in topic_lower
+        tennis_suffix = " for tennis fans" if has_tennis else ""
+        tennis_app_desc = " as an application for tennis betting." if has_tennis else " as my first complete project."
         if mode == "short":
             if has_lead_in and "recently i built" in lead_in.lower():
-                text = "Recently I built Match Point, a betting platform for tennis fans. Because live match data was unavailable, it operates with static match data and simulated match progression without live connectivity."
+                text = f"Recently I built Match Point, a betting platform{tennis_suffix}. Because live match data was unavailable, it operates with static match data and simulated match progression without live connectivity."
             else:
-                text = "I built Match Point as a betting platform for tennis fans. Because live match data was unavailable, it operates with static match data and simulated match progression without live connectivity."
+                text = f"I built Match Point as a betting platform{tennis_suffix}. Because live match data was unavailable, it operates with static match data and simulated match progression without live connectivity."
         elif mode == "long":
             p1 = (
-                "Recently I built Match Point, a betting platform for tennis fans. "
-                "The project was created as an application for tennis betting."
+                f"Recently I built Match Point, a betting platform{tennis_suffix}. "
+                f"The project was created{tennis_app_desc}"
                 if has_lead_in and "recently i built" in lead_in.lower()
-                else "I built Match Point as a betting platform for tennis fans. "
-                "The project was created as an application for tennis betting."
+                else f"I built Match Point as a betting platform{tennis_suffix}. "
+                f"The project was created{tennis_app_desc}"
             )
             p2 = (
                 "During development, I could not get live match data, so I built a static version with static match data and simulated match progression where matches never end through a live feed. "
@@ -632,13 +635,13 @@ def build_grounded_fallback_draft(
         else:  # medium
             if has_lead_in and "recently i built" in lead_in.lower():
                 text = (
-                    "Recently I built Match Point, a betting platform for tennis fans. "
+                    f"Recently I built Match Point, a betting platform{tennis_suffix}. "
                     "When developing the application, live match data was unavailable, so I built a static version with static match data and simulated match progression. "
                     "The application operates using this static match data rather than live external updates."
                 )
             else:
                 text = (
-                    "I built Match Point as a betting platform for tennis fans. "
+                    f"I built Match Point as a betting platform{tennis_suffix}. "
                     "When developing the application, live match data was unavailable, so I built a static version with static match data and simulated match progression. "
                     "The application operates using this static match data rather than live external updates."
                 )
@@ -724,19 +727,22 @@ def validate_grounding(
     personal_knowledge: List[str],
     draft: str,
 ) -> Dict[str, Any]:
-    """Conservative, deterministic rule-based grounding check for clearly unsupported claims."""
+    """
+    Conservative, deterministic rule-based grounding check for clearly unsupported claims.
+    Note: These regex boundaries act as defensive guardrails and do not claim 100% semantic verification.
+    """
     issues = []
     text_lower = draft.lower()
     topic_lower = topic.lower()
     has_facts = personal_knowledge and any(item.strip() for item in personal_knowledge)
 
-    # 1. Third-party attribution check
+    # 1. Third-party attribution & collective instruction check
     if has_facts:
         if re.search(
-            r"\b(my friend|a friend|friends|my colleague|colleagues|someone else|another developer|my buddy|a buddy|buddies|coworker|co-worker|coworkers|co-workers|teammate|teammates|team member|someone i know)\b",
+            r"\b(my friend|a friend|friends|my colleague|colleagues|someone else|another developer|my buddy|a buddy|buddies|coworker|co-worker|coworkers|co-workers|teammate|teammates|team member|someone i know|we were told|i was told|they told (?:me|us)|our team told|assigned to (?:me|us)|was instructed to|were instructed to)\b",
             text_lower,
         ):
-            issues.append("third_party_attribution: Project or skill attributed to someone other than author")
+            issues.append("third_party_attribution: Project or skill attributed to third parties, external instructors, or collective assignments ('we were told')")
     else:
         # In zero-fact mode, flag only if explicitly attributing a project or skill development to a third party
         if re.search(
@@ -747,6 +753,16 @@ def validate_grounding(
             text_lower,
         ):
             issues.append("third_party_attribution: Project or skill attributed to someone other than author")
+
+    # 1.5 Match Point project subject check
+    has_match_point_fact = any("match point" in k.lower() for k in personal_knowledge)
+    is_match_point_topic = "match point" in topic_lower or "betting platform" in topic_lower or "tennis" in topic_lower
+    if has_match_point_fact and is_match_point_topic:
+        has_subject_mention = bool(
+            re.search(r"\b(match point|betting platform|betting app|betting simulation|betting project)\b", text_lower)
+        )
+        if not has_subject_mention:
+            issues.append("missing_project_subject: Match Point draft omitted the project name or supported equivalent ('Match Point' or 'betting platform')")
 
     # 2. Negative limitation inversion check (claiming live sync or real-time feeds on a static/offline project)
     is_static_project = any(
@@ -767,7 +783,7 @@ def validate_grounding(
             suffix = text_lower[end_pos : min(len(text_lower), end_pos + 60)]
             is_negated = bool(
                 re.search(
-                    r"\b(?:no|not|never|without|lacks?|unavailability of|does not have|do not have|cannot (?:get|access|provide)|could not (?:get|access|obtain|use)|neither|instead of|rather than (?:relying on|using))\b.*?(?:external\b\s*)?$",
+                    r"\b(?:no|not|never|without|lacks?|unavailability of|does not have|do not have|cannot (?:get|access|provide)?|can't (?:get|access|provide)?|could not (?:get|access|obtain|use)?|couldn't (?:get|access|obtain|use)?|unable to (?:get|access|obtain|use)?|failed to (?:get|access|obtain|use)?|neither|instead of|rather than (?:relying on|using)?)\b.*?(?:external\b\s*)?$",
                     prefix.strip(),
                     re.I,
                 )
@@ -783,11 +799,13 @@ def validate_grounding(
                 break
 
     # 3. Mandatory limitation preservation / omission check
-    is_match_point_topic = "match point" in topic_lower or "betting platform" in topic_lower or "tennis" in topic_lower
     has_match_point_limitation = any("static" in k.lower() or "simulat" in k.lower() or "live" in k.lower() for k in personal_knowledge)
     if is_match_point_topic and has_match_point_limitation:
         has_static_mention = bool(
-            re.search(r"\b(static|simulat|no live|without live|cannot get live|not have live|does not have live|self-contained)\b", text_lower)
+            re.search(
+                r"\b(static|simulat|self-contained|no live match(?:es)?|no live data|without live match(?:es)?|without live data|cannot get live match(?:es)?|cannot get live data|not have live match(?:es)?|not have live data|does not have live match(?:es)?|does not have live data|lacks live match(?:es)?|lacks live data|no live feed|without live feed)\b",
+                text_lower,
+            )
         )
         if not has_static_mention:
             issues.append("limitation_omission: Project draft omitted mandatory static-data or simulated-progression limitation")
@@ -808,6 +826,7 @@ def validate_grounding(
             (r"\b(?:openai|chatgpt|gpt-?3(?:\.5)?|gpt-?4|claude|gemini|anthropic)\b", "OpenAI/third-party LLM providers"),
             (r"\b(?:web\s*apis?|rest\s*apis?|graphql|websockets?)\b", "external APIs/WebSockets"),
             (r"\b(?:building (?:ai )?models from scratch|training models from scratch)\b", "unsupported model-building methodology"),
+            (r"\b(?:live\s+databases?|live\s+chats?|cloud\s+servers?|cloud\s+backends?|real-time\s+chat)\b", "unsupported infrastructure (live database, live chat, or cloud servers)"),
         ]
         for pattern, tech_desc in unsupported_tech_terms:
             if re.search(pattern, text_lower):
@@ -1655,11 +1674,11 @@ class PersonalizedWritingGenerator:
         )
         fallback_used = False
         source = "lora_sampled" if do_sample else "lora_greedy"
+        fb_adopted = False
 
         if not quality_result["is_acceptable"]:
             # If initial generation failed quality checks (grounding, meta-commentary, or length),
             # first try deterministic greedy retry if sampled
-            fb_adopted = False
             if do_sample:
                 t_fb_start = time.perf_counter()
                 with torch.inference_mode():
@@ -1690,7 +1709,7 @@ class PersonalizedWritingGenerator:
                     complete_draft = fb_draft
                     num_generated_tokens = len(fb_tokens)
                     quality_result = fb_quality
-                    fallback_used = True
+                    fallback_used = False
                     fb_adopted = True
                     source = "lora_greedy"
 
@@ -1719,7 +1738,7 @@ class PersonalizedWritingGenerator:
                 source = "grounded_fallback"
 
         # Check for consecutive identical opening hooks in sampled generation
-        if do_sample and quality_result["is_acceptable"] and not fallback_used:
+        if do_sample and quality_result["is_acceptable"] and not fallback_used and not fb_adopted:
             current_hook = extract_opening_hook(complete_draft, num_words=5)
             if self.last_opening_hook and current_hook and current_hook == self.last_opening_hook:
                 alt_seed = (seed * 37 + 19) % 100000 + 1

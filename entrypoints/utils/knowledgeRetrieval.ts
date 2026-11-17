@@ -31,6 +31,21 @@ export const COMMON_STOP_WORDS = new Set([
   'wouldnt', 'you', 'your', 'yours', 'yourself', 'yourselves'
 ]);
 
+/**
+ * Procedural intent and formatting tokens describing prompt structure or output format,
+ * rather than the subject matter or personal knowledge domain.
+ * Filtering these prevents generic requests (e.g. "casual social media post about X")
+ * from matching unrelated facts that mention "post" or "social".
+ */
+export const PROMPT_INTENT_STOP_WORDS = new Set([
+  'post', 'posts', 'social', 'media', 'casual', 'write', 'writing', 'draft',
+  'drafts', 'tweet', 'tweets', 'article', 'articles', 'essay', 'essays',
+  'paragraph', 'paragraphs', 'sentence', 'sentences', 'summary', 'summaries',
+  'reflection', 'reflections', 'thoughts', 'update', 'updates', 'note', 'notes',
+  'message', 'messages', 'share', 'sharing', 'tell', 'talk', 'talking', 'create',
+  'content', 'short', 'medium', 'long', 'professional', 'simple',
+]);
+
 export interface RetrievedKnowledgeResult {
   items: PersonalKnowledgeItem[];
   formattedStrings: string[];
@@ -42,6 +57,7 @@ export interface RetrievedKnowledgeResult {
 
 /**
  * Extracts meaningful non-stopword tokens from a given topic or text.
+ * Filters both general stop words and prompt-intent formatting terms when substantive keywords exist.
  */
 export function extractTopicKeywords(topic: string): string[] {
   if (!topic || typeof topic !== 'string') {
@@ -57,32 +73,167 @@ export function extractTopicKeywords(topic: string): string[] {
     .filter((token) => token.length >= 2);
 
   const meaningfulKeywords: string[] = [];
+  const fallbackKeywords: string[] = [];
   const seen = new Set<string>();
 
   for (const token of rawTokens) {
     if (!COMMON_STOP_WORDS.has(token) && !seen.has(token)) {
       seen.add(token);
-      meaningfulKeywords.push(token);
+      fallbackKeywords.push(token);
+      if (!PROMPT_INTENT_STOP_WORDS.has(token)) {
+        meaningfulKeywords.push(token);
+      }
     }
   }
 
-  return meaningfulKeywords;
+  // Use substantive keywords if any exist; otherwise gracefully fall back to non-stop tokens
+  return meaningfulKeywords.length > 0 ? meaningfulKeywords : fallbackKeywords;
 }
 
-function toFirstPersonVerb(verb: string): string {
-  const v = verb.toLowerCase().trim();
-  if (v === 'uses') return 'use';
-  if (v === 'plans') return 'plan';
+// Irregular English verb/noun stem mappings for lightweight retrieval
+const IRREGULAR_STEMS: Record<string, string> = {
+  built: 'build',
+  thought: 'think',
+  thoughts: 'think',
+  wrote: 'write',
+  written: 'write',
+  knew: 'know',
+  known: 'know',
+  knowledge: 'know',
+  began: 'begin',
+  begun: 'begin',
+  ran: 'run',
+};
+
+/**
+ * Lightweight, deterministic English stemmer for browser execution.
+ * Handles common morphological variations:
+ * - argue ↔ arguments ↔ arguing ↔ argument
+ * - listen ↔ listening ↔ listened
+ * - learn ↔ learning ↔ learned
+ * - build ↔ building ↔ built
+ * - code ↔ coding ↔ codes
+ */
+export function stemWord(word: string): string {
+  if (!word || typeof word !== 'string') return '';
+  let w = word.toLowerCase().trim();
+  if (w.length <= 3) return w;
+
+  const irregular = IRREGULAR_STEMS[w];
+  if (irregular) {
+    return irregular;
+  }
+
+  // Common morphological suffixes in English
+  if (w.endsWith('ments')) w = w.slice(0, -5);
+  else if (w.endsWith('ment')) w = w.slice(0, -4);
+  else if (w.endsWith('ations')) w = w.slice(0, -6);
+  else if (w.endsWith('ation')) w = w.slice(0, -5);
+  else if (w.endsWith('tions') || w.endsWith('sions')) w = w.slice(0, -5);
+  else if (w.endsWith('tion') || w.endsWith('sion')) w = w.slice(0, -4);
+  else if (w.endsWith('ings')) w = w.slice(0, -4);
+  else if (w.endsWith('ing') && w.length > 5) {
+    w = w.slice(0, -3);
+    const last = w.charAt(w.length - 1);
+    const prev = w.charAt(w.length - 2);
+    if (w.length >= 4 && last === prev && last !== 'l' && last !== 's') {
+      w = w.slice(0, -1);
+    }
+  } else if (w.endsWith('ies') && w.length > 4) {
+    w = w.slice(0, -3) + 'y';
+  } else if (w.endsWith('ed') && w.length > 4) {
+    w = w.slice(0, -2);
+    const last = w.charAt(w.length - 1);
+    const prev = w.charAt(w.length - 2);
+    if (w.length >= 4 && last === prev && last !== 'l' && last !== 's') {
+      w = w.slice(0, -1);
+    }
+  } else if (w.endsWith('ers') && w.length > 5) {
+    w = w.slice(0, -3);
+  } else if (w.endsWith('er') && w.length > 4) {
+    w = w.slice(0, -2);
+  } else if (w.endsWith('es') && w.length > 4 && !w.endsWith('ies')) {
+    w = w.slice(0, -2);
+  } else if (w.endsWith('s') && !w.endsWith('ss') && w.length > 3) {
+    w = w.slice(0, -1);
+  }
+
+  // Trim trailing silent 'e' for consistent verb/noun unification (e.g. argue -> argu, code -> cod)
+  if (w.endsWith('e') && w.length > 3) {
+    w = w.slice(0, -1);
+  }
+
+  return w;
+}
+
+/**
+ * Checks whether a subject string represents an author/user meta-placeholder
+ * (e.g. 'the user', 'user', 'author') rather than a specific project or domain topic.
+ */
+export function isAuthorSubject(subject: string): boolean {
+  const s = (subject || '').toLowerCase().trim();
+  return (
+    s === 'the user' ||
+    s === 'user' ||
+    s === 'author' ||
+    s === 'the author' ||
+    s === 'i' ||
+    s === 'me' ||
+    s === 'myself' ||
+    s.startsWith('i ') ||
+    s.startsWith('my ')
+  );
+}
+
+function escapeRegExp(string: string): string {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Tests for whole-word exact matches and morphological stem matches in text tokens.
+ */
+export function matchKeywordInText(kw: string, kwStem: string, text: string): { exact: boolean; stem: boolean } {
+  if (!text) return { exact: false, stem: false };
+
+  // 1. Exact whole-word boundary match
+  const kwRegex = new RegExp(`\\b${escapeRegExp(kw)}\\b`, 'i');
+  if (kwRegex.test(text)) {
+    return { exact: true, stem: false };
+  }
+
+  // 2. Stem match across individual tokens
+  if (kwStem && kwStem.length >= 3) {
+    const tokens = text
+      .toLowerCase()
+      .replace(/[^\w\s-]/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length >= 2);
+
+    for (const t of tokens) {
+      if (stemWord(t) === kwStem) {
+        return { exact: false, stem: true };
+      }
+    }
+  }
+
+  return { exact: false, stem: false };
+}
+
+export function toFirstPersonVerb(verb: string): string {
+  const trimmed = (verb || '').trim();
+  const v = trimmed.toLowerCase();
+  if (v === 'uses' || v.startsWith('uses ')) return 'use' + trimmed.slice(4);
+  if (v === 'plans' || v.startsWith('plans ')) return 'plan' + trimmed.slice(5);
   if (v === 'plans to learn') return 'plan to learn';
-  if (v === 'wants') return 'want';
+  if (v === 'wants' || v.startsWith('wants ')) return 'want' + trimmed.slice(5);
   if (v === 'wants to learn') return 'want to learn';
-  if (v === 'aims') return 'aim';
+  if (v === 'aims' || v.startsWith('aims ')) return 'aim' + trimmed.slice(4);
   if (v === 'aims to') return 'aim to';
-  if (v === 'believes') return 'believe';
-  if (v === 'prefers') return 'prefer';
-  if (v === 'likes') return 'like';
-  if (v === 'has') return 'have';
-  if (v === 'is') return 'am';
+  if (v === 'believes' || v.startsWith('believes ')) return 'believe' + trimmed.slice(8);
+  if (v === 'prefers' || v.startsWith('prefers ')) return 'prefer' + trimmed.slice(7);
+  if (v === 'likes' || v.startsWith('likes ')) return 'like' + trimmed.slice(5);
+  if (v === 'has' || v.startsWith('has ')) return 'have' + trimmed.slice(3);
+  if (v === 'is' || v.startsWith('is ')) return 'am' + trimmed.slice(2);
   return verb;
 }
 
@@ -125,7 +276,7 @@ export function formatAffirmativeConstraint(subject: string, rawConstraint: stri
     return `For my project ${subject}, actual reality: operates as a local or static implementation without ${rawConstraint.replace(/^(could not|unable to|lacks)\s+/i, '')}.`;
   }
 
-  return `For my project ${subject}, actual reality: ${rawConstraint}. (Strict reality: operates locally/statically; never claim unverified live or cloud feeds.)`;
+  return `For my project ${subject}, actual reality: ${rawConstraint}.`;
 }
 
 /**
@@ -191,6 +342,55 @@ export function isAutobiographicalTopic(topic: string): boolean {
 }
 
 /**
+ * Detects whether a statement describes interpersonal communication behavior
+ * (debates, discussions, arguments, listening to others, collaboration).
+ */
+export function isInterpersonalBehavior(predicate: string, value: string): boolean {
+  const combined = `${predicate} ${value}`.toLowerCase();
+  return /\b(argue|arguing|arguments?|disagree|disagreement|discussions?|debate|debating|debates?|listen|listening|put my point|point of view|viewpoints?|differing opinions)\b/i.test(
+    combined
+  );
+}
+
+/**
+ * Formats interpersonal communication habits cleanly and naturally
+ * without duplicating predicates or confusing them with future goals or dev workflows.
+ */
+function formatInterpersonalApproach(predicate: string, value: string): string {
+  const cleanPred = predicate.trim();
+  const cleanVal = value.trim();
+  const lowerPred = cleanPred.toLowerCase();
+  const lowerVal = cleanVal.toLowerCase();
+
+  // If value already includes the predicate (e.g. value has "listen to theirs as well")
+  if (lowerPred && lowerVal.includes(lowerPred)) {
+    const naturalVal = cleanVal.charAt(0).toLowerCase() + cleanVal.slice(1);
+    if (lowerVal.startsWith('if ')) {
+      return `[Personal Approach]: In discussions, ${naturalVal}.`;
+    }
+    return `[Personal Approach]: In discussions, I ${naturalVal}.`;
+  }
+
+  // If value starts with a condition like "If I have..."
+  if (lowerVal.startsWith('if ')) {
+    const naturalVal = cleanVal.charAt(0).toLowerCase() + cleanVal.slice(1);
+    return `[Personal Approach]: In discussions, ${naturalVal}, I ${toFirstPersonVerb(cleanPred)}.`;
+  }
+
+  // If predicate starts with "if "
+  if (lowerPred.startsWith('if ')) {
+    const naturalPred = cleanPred.charAt(0).toLowerCase() + cleanPred.slice(1);
+    return `[Personal Approach]: In discussions, ${naturalPred}, I ${cleanVal}.`;
+  }
+
+  const verbPhrase = toFirstPersonVerb(cleanPred);
+  if (cleanVal) {
+    return `[Personal Approach]: In discussions, I ${verbPhrase} ${cleanVal}.`;
+  }
+  return `[Personal Approach]: In discussions, I ${verbPhrase}.`;
+}
+
+/**
  * Formats a knowledge item into an explicit first-person factual statement.
  * Guarantees that the author ('I') is framed as the direct owner/subject of
  * the project, skill, habit, preference, or goal, preventing 3rd-person hallucination.
@@ -204,14 +404,20 @@ export function formatKnowledgeItemForGeneration(item: PersonalKnowledgeItem): s
 
   const lowerSubject = subject.toLowerCase();
   const lowerPredicate = predicate.toLowerCase().replace(/_/g, ' ');
+  const isAuthor = isAuthorSubject(subject);
 
   let statement = '';
 
-  // 1. If subject already explicitly refers to the author ('I', 'my ...', 'me')
-  if (lowerSubject === 'i' || lowerSubject.startsWith('i ') || lowerSubject.startsWith('my ')) {
+  // 1. Interpersonal behavior (discussions, debates, arguments) takes precedence
+  // regardless of whether legacy extraction tagged it as habits, goals, or opinions.
+  if (isInterpersonalBehavior(predicate, value)) {
+    statement = formatInterpersonalApproach(predicate, value);
+  }
+  // 2. If subject already explicitly refers to the author ('I', 'my ...', 'me')
+  else if (lowerSubject === 'i' || lowerSubject.startsWith('i ') || lowerSubject.startsWith('my ') || lowerSubject === 'me') {
     statement = `${subject} ${predicate} ${value}`;
   }
-  // 2. Projects category
+  // 3. Projects category
   else if (category === 'projects') {
     if (
       lowerPredicate === 'built' ||
@@ -219,27 +425,44 @@ export function formatKnowledgeItemForGeneration(item: PersonalKnowledgeItem): s
       lowerPredicate === 'developed' ||
       lowerPredicate === 'made'
     ) {
-      const valueDetails = value
-        ? value.toLowerCase().startsWith('a ') ||
-          value.toLowerCase().startsWith('an ') ||
-          value.toLowerCase().startsWith('the ')
-          ? `, ${value}`
-          : ` (${value})`
+      let cleanVal = value;
+      if (cleanVal) {
+        cleanVal = cleanVal
+          .replace(/\b(?:(?:that|which)\s+)?(?:i|we)\s+(?:built|created|developed|made)\s+/gi, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+      const projName = isAuthor ? (cleanVal || 'a project') : subject;
+      const valueDetails = !isAuthor && cleanVal
+        ? cleanVal.toLowerCase().startsWith('a ') ||
+          cleanVal.toLowerCase().startsWith('an ') ||
+          cleanVal.toLowerCase().startsWith('the ')
+          ? `, ${cleanVal}`
+          : ` (${cleanVal})`
         : '';
-      statement = `[Completed Project]: I built ${subject}${valueDetails}. (Status: Completed by me; not an ongoing attempt or another person's project.)`;
+      statement = `[Completed Project]: I built ${projName}${valueDetails}.`;
+    } else if (
+      lowerPredicate === 'built for' ||
+      lowerPredicate === 'created for' ||
+      lowerPredicate === 'developed for'
+    ) {
+      const projName = isAuthor ? (subject && !isAuthorSubject(subject) ? subject : 'my project') : subject;
+      statement = `[Project Context]: I built ${projName} for ${value}.`;
     } else if (
       lowerPredicate.includes('difficulty') ||
       lowerPredicate.includes('constraint') ||
       lowerPredicate.includes('limitation') ||
       lowerPredicate.includes('workaround')
     ) {
-      const affirmativeReality = formatAffirmativeConstraint(subject, value);
+      const affirmativeReality = formatAffirmativeConstraint(isAuthor ? 'my project' : subject, value);
       statement = `[Project Architecture & Reality]: ${affirmativeReality}`;
     } else {
-      statement = `[Project Detail]: For my project ${subject}, I ${toFirstPersonVerb(lowerPredicate)} ${value}.`;
+      statement = isAuthor
+        ? `[Project Detail]: I ${toFirstPersonVerb(lowerPredicate)} ${value}.`
+        : `[Project Detail]: For my project ${subject}, I ${toFirstPersonVerb(lowerPredicate)} ${value}.`;
     }
   }
-  // 3. Skills category
+  // 4. Skills category
   else if (category === 'skills') {
     if (
       lowerPredicate === 'uses' ||
@@ -248,36 +471,64 @@ export function formatKnowledgeItemForGeneration(item: PersonalKnowledgeItem): s
       lowerPredicate === 'proficient in' ||
       lowerPredicate === 'skilled in'
     ) {
-      statement = `[Current Mastered Skill]: I already learned and actively use ${subject}${value ? ` (${value})` : ''}. (This is an existing skill, not a future goal.)`;
+      const skillName = isAuthor ? value : subject;
+      const detail = !isAuthor && value ? ` (${value})` : '';
+      statement = `[Current Skill]: I learned and actively use ${skillName}${detail}.`;
     } else {
-      statement = `[Current Mastered Skill]: I have experience with ${subject}: ${predicate} ${value}. (This is an existing skill, not a future goal.)`;
+      statement = isAuthor
+        ? `[Current Skill]: I have experience with ${value || predicate}.`
+        : `[Current Skill]: I have experience with ${subject}: ${predicate} ${value}.`;
     }
   }
-  // 4. Goals category
+  // 5. Goals category
   else if (category === 'goals') {
-    const goalText = [lowerPredicate, value].filter(Boolean).join(' ');
-    if (goalText.startsWith('plans to ') || goalText.startsWith('wants to ') || goalText.startsWith('aims to ')) {
-      const action = goalText.replace(/^(plans to|wants to|aims to)\s+/, '');
-      statement = `[Future Learning Goal (Not yet started)]: My goal is to ${action} (${subject}). (Strictly a personal learning objective; not a business venture or commercial plan.)`;
+    const rawGoal = [lowerPredicate, value].filter(Boolean).join(' ');
+    if (isAuthor) {
+      const action = rawGoal.replace(/^(plans to|wants to|aims to|planning to|plan to|want to|aim to)\s+/, '');
+      statement = `[Future Goal]: My goal is to ${action}.`;
     } else {
-      statement = `[Future Learning Goal (Not yet started)]: My goal for ${subject} is to ${value || predicate}. (Strictly a personal learning objective; not a business venture or commercial plan.)`;
+      if (rawGoal.startsWith('plans to ') || rawGoal.startsWith('wants to ') || rawGoal.startsWith('aims to ')) {
+        const action = rawGoal.replace(/^(plans to|wants to|aims to)\s+/, '');
+        statement = `[Future Goal]: My goal is to ${action} (${subject}).`;
+      } else {
+        statement = `[Future Goal]: My goal for ${subject} is to ${value || predicate}.`;
+      }
     }
   }
-  // 5. Habits category
+  // 6. Habits category
   else if (category === 'habits') {
-    statement = `[Work Routine]: In my workflow with ${subject}, I ${toFirstPersonVerb(lowerPredicate)} ${value}. (Only use the tools explicitly stated; do not extrapolate unmentioned software or platforms.)`;
+    const cleanPred = predicate.replace(/_/g, ' ');
+    const isWorkflow = /\b(code|coding|dev|develop|workflow|git|commit|test|testing|build|deploy)\b/i.test(
+      `${subject} ${cleanPred} ${value}`
+    );
+    if (isWorkflow) {
+      statement = isAuthor
+        ? `[Work Routine]: In my workflow, I ${toFirstPersonVerb(cleanPred)} ${value}.`
+        : `[Work Routine]: In my workflow with ${subject}, I ${toFirstPersonVerb(cleanPred)} ${value}.`;
+    } else {
+      statement = isAuthor
+        ? `[Personal Habit]: I ${toFirstPersonVerb(cleanPred)} ${value}.`
+        : `[Personal Habit]: With ${subject}, I ${toFirstPersonVerb(cleanPred)} ${value}.`;
+    }
   }
-  // 6. Preferences category
+  // 7. Preferences category
   else if (category === 'preferences') {
-    statement = `[Personal Preference]: I prefer ${subject}: ${value || predicate}.`;
+    statement = isAuthor
+      ? `[Personal Preference]: I prefer ${value || predicate}.`
+      : `[Personal Preference]: I prefer ${subject}: ${value || predicate}.`;
   }
-  // 7. Opinions category
+  // 8. Opinions category
   else if (category === 'opinions') {
-    statement = `[Personal Perspective]: On ${subject}, my perspective is that ${value || predicate}.`;
+    statement = isAuthor
+      ? `[Personal Perspective]: My perspective is that ${value || predicate}.`
+      : `[Personal Perspective]: On ${subject}, my perspective is that ${value || predicate}.`;
   }
-  // 8. General fallback
+  // 9. General fallback
   else {
-    statement = `[Personal Fact]: I ${toFirstPersonVerb(lowerPredicate)} ${subject} ${value}.`;
+    const cleanPred = predicate.replace(/_/g, ' ');
+    statement = isAuthor
+      ? `[Personal Fact]: I ${toFirstPersonVerb(cleanPred)} ${value}.`
+      : `[Personal Fact]: I ${toFirstPersonVerb(cleanPred)} ${subject} ${value}.`;
   }
 
   // Clean double spaces, punctuation, and enforce character limit
@@ -307,50 +558,76 @@ export function scoreKnowledgeItem(
     return 0;
   }
 
-  const subject = (item.subject || '').toLowerCase();
-  const predicate = (item.predicate || '').toLowerCase();
-  const value = (item.value || '').toLowerCase();
-  const contextScope = (item.contextScope || '').toLowerCase();
+  const subject = (item.subject || '').toLowerCase().trim();
+  const predicate = (item.predicate || '').toLowerCase().trim();
+  const value = (item.value || '').toLowerCase().trim();
+  const contextScope = (item.contextScope || '').toLowerCase().trim();
+  const isAuthor = isAuthorSubject(subject);
 
   let matchScore = 0;
   let hasMatch = false;
+  let subjectMatches = 0;
+  let valueMatches = 0;
+  let predicateMatches = 0;
 
   for (const kw of keywords) {
-    const kwRegex = new RegExp(`\\b${kw}\\b`, 'i');
+    const kwStem = stemWord(kw);
 
-    // Subject matches (strongest topical grounding)
-    if (kwRegex.test(subject)) {
-      matchScore += 6;
-      hasMatch = true;
-    } else if (subject.includes(kw)) {
-      matchScore += 2;
-      hasMatch = true;
+    // 1. Subject matches (strongest topical anchor when not a generic author placeholder)
+    if (!isAuthor && subject) {
+      const subMatch = matchKeywordInText(kw, kwStem, subject);
+      if (subMatch.exact) {
+        matchScore += 8;
+        hasMatch = true;
+        subjectMatches++;
+      } else if (subMatch.stem) {
+        matchScore += 6;
+        hasMatch = true;
+        subjectMatches++;
+      }
     }
 
-    // Value matches (details of project, skill, preference)
-    if (kwRegex.test(value)) {
-      matchScore += 5;
-      hasMatch = true;
-    } else if (value.includes(kw)) {
-      matchScore += 2;
-      hasMatch = true;
-    }
-
-    // Context scope matches
-    if (contextScope) {
-      if (kwRegex.test(contextScope)) {
+    // 2. Value matches (details of project, skill, preference)
+    if (value) {
+      const valMatch = matchKeywordInText(kw, kwStem, value);
+      if (valMatch.exact) {
+        matchScore += 5;
+        hasMatch = true;
+        valueMatches++;
+      } else if (valMatch.stem) {
         matchScore += 4;
         hasMatch = true;
-      } else if (contextScope.includes(kw)) {
-        matchScore += 1;
+        valueMatches++;
+      }
+    }
+
+    // 3. Context scope matches
+    if (contextScope) {
+      const ctxMatch = matchKeywordInText(kw, kwStem, contextScope);
+      if (ctxMatch.exact) {
+        matchScore += 4;
+        hasMatch = true;
+      } else if (ctxMatch.stem) {
+        matchScore += 3;
         hasMatch = true;
       }
     }
 
-    // Predicate matches
-    if (kwRegex.test(predicate)) {
-      matchScore += 3;
-      hasMatch = true;
+    // 4. Predicate matches
+    // When subject is the author, the predicate is the primary action anchor of the statement
+    if (predicate) {
+      const predMatch = matchKeywordInText(kw, kwStem, predicate);
+      if (predMatch.exact) {
+        const points = isAuthor ? 8 : 3;
+        matchScore += points;
+        hasMatch = true;
+        predicateMatches++;
+      } else if (predMatch.stem) {
+        const points = isAuthor ? 7 : 2;
+        matchScore += points;
+        hasMatch = true;
+        predicateMatches++;
+      }
     }
   }
 
@@ -358,30 +635,85 @@ export function scoreKnowledgeItem(
     return 0;
   }
 
-  // Preference for higher importance
-  if (item.importance === 'primary') {
-    matchScore += 3;
-  } else if (item.importance === 'secondary') {
-    matchScore += 1;
+  // Multi-term reinforcement: reward items that match multiple distinct prompt keyword roots
+  const matchedRoots = new Set<string>();
+  for (const kw of keywords) {
+    const kwStem = stemWord(kw);
+    const inSub = !isAuthor && subject && (matchKeywordInText(kw, kwStem, subject).exact || matchKeywordInText(kw, kwStem, subject).stem);
+    const inVal = value && (matchKeywordInText(kw, kwStem, value).exact || matchKeywordInText(kw, kwStem, value).stem);
+    const inPred = predicate && (matchKeywordInText(kw, kwStem, predicate).exact || matchKeywordInText(kw, kwStem, predicate).stem);
+    const inCtx = contextScope && (matchKeywordInText(kw, kwStem, contextScope).exact || matchKeywordInText(kw, kwStem, contextScope).stem);
+
+    if (inSub || inVal || (isAuthor && inPred) || inCtx) {
+      matchedRoots.add(kwStem);
+    }
   }
 
-  // Preference for higher confidence
+  if (matchedRoots.size > 1) {
+    matchScore += matchedRoots.size * 2;
+  }
+
+  // Preference for higher importance (tie-breaker)
+  if (item.importance === 'primary') {
+    matchScore += 1.0;
+  } else if (item.importance === 'secondary') {
+    matchScore += 0.5;
+  }
+
+  // Preference for higher confidence (tie-breaker)
   if (item.confidence === 'high') {
-    matchScore += 2;
+    matchScore += 0.5;
   } else if (item.confidence === 'medium') {
-    matchScore += 1;
+    matchScore += 0.25;
   }
 
   return matchScore;
 }
 
 /**
- * Retrieves at most 10 active, verified, relevant personal knowledge items matching the topic.
+ * Checks whether a candidate knowledge item is redundant or a near-duplicate
+ * of an already accepted item for the same subject.
+ */
+function isNearDuplicate(item: PersonalKnowledgeItem, accepted: PersonalKnowledgeItem[]): boolean {
+  const normSub = (item.subject || '').toLowerCase().trim();
+  const normPred = (item.predicate || '').toLowerCase().trim().replace(/_/g, ' ');
+  const normVal = (item.value || '').toLowerCase().trim();
+
+  for (const prev of accepted) {
+    const prevSub = (prev.subject || '').toLowerCase().trim();
+    const prevPred = (prev.predicate || '').toLowerCase().trim().replace(/_/g, ' ');
+    const prevVal = (prev.value || '').toLowerCase().trim();
+
+    if (normSub === prevSub) {
+      // 1. Identical value, or one substantive value subsumes the other
+      if (normVal && prevVal) {
+        if (normVal === prevVal) {
+          return true;
+        }
+        if (prevVal.length >= 4 && normVal.includes(prevVal)) {
+          return true;
+        }
+        if (normVal.length >= 4 && prevVal.includes(normVal)) {
+          return true;
+        }
+      }
+      // 2. Same subject and predicate where one or both values are empty
+      if (normPred === prevPred && (!normVal || !prevVal)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Retrieves at most 5 active, verified, highly relevant personal knowledge items matching the topic.
+ * Applies relative score thresholding and deduplication to avoid context bloat.
  */
 export async function retrieveRelevantKnowledge(
   topic: string,
   targetDb: EchoDatabase = db,
-  maxItems: number = 10
+  maxItems: number = 5
 ): Promise<RetrievedKnowledgeResult> {
   const keywords = extractTopicKeywords(topic);
 
@@ -415,18 +747,25 @@ export async function retrieveRelevantKnowledge(
       continue;
     }
 
-    // Ensure item has an ID to query evidence
+    // Ensure item has an ID to query evidence or participate in retrieval
     if (typeof item.id !== 'number') {
       continue;
     }
 
-    // Verify valid supporting evidence exists
-    const evidenceList: KnowledgeEvidence[] = await getKnowledgeEvidence(item.id, targetDb);
-    const hasValidEvidence = evidenceList.some((e) => e.isValid === true);
+    // Verify valid supporting evidence exists for extracted and legacy facts.
+    // Facts explicitly marked as manual (sourceType === 'manual') are curated directly by the user
+    // and are valid without requiring evidence records.
+    // Legacy facts (where sourceType is undefined) are treated as extracted and must pass evidence validation.
+    const isManual = item.sourceType === 'manual';
 
-    if (!hasValidEvidence) {
-      // Excluded: archived evidence, invalidated evidence, or orphaned knowledge
-      continue;
+    if (!isManual) {
+      const evidenceList: KnowledgeEvidence[] = await getKnowledgeEvidence(item.id, targetDb);
+      const hasValidEvidence = evidenceList.some((e) => e.isValid === true);
+
+      if (!hasValidEvidence) {
+        // Excluded: archived evidence, invalidated evidence, or orphaned knowledge
+        continue;
+      }
     }
 
     candidateItems.push(item);
@@ -455,8 +794,23 @@ export async function retrieveRelevantKnowledge(
     return (b.item.id ?? 0) - (a.item.id ?? 0);
   });
 
-  // 5. Cap at maxItems (up to 10)
-  const topItems = scoredItems.slice(0, maxItems).map((s) => s.item);
+  // 5. Relative relevance cutoff:
+  // When top score is strong (>= 10), reject incidental/weak matches that do not meet the relative threshold.
+  const topScore = scoredItems[0]?.score ?? 0;
+  const cutoff = topScore >= 10 ? Math.max(7.5, topScore * 0.50) : 3.0;
+  const filteredScoredItems = scoredItems.filter((s) => s.score >= cutoff);
+
+  // 6. Deduplicate near-duplicate facts and cap at maxItems (default 5)
+  const topItems: PersonalKnowledgeItem[] = [];
+  for (const s of filteredScoredItems) {
+    if (!isNearDuplicate(s.item, topItems)) {
+      topItems.push(s.item);
+      if (topItems.length >= maxItems) {
+        break;
+      }
+    }
+  }
+
   const formattedStrings = topItems.map(formatKnowledgeItemForGeneration);
 
   const hasRelevant = topItems.length > 0;

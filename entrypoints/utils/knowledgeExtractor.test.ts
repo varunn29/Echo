@@ -6,6 +6,7 @@ import {
   createEchoDatabase,
   deleteWritingMessage,
   saveWritingMessage,
+  addManualPersonalKnowledge,
   type EchoDatabase,
 } from './database';
 import {
@@ -632,6 +633,427 @@ describe('Knowledge Extraction Suite', function () {
       const evidence = await testDb.knowledgeEvidence.toArray();
       expect(items).toHaveLength(1);
       expect(evidence).toHaveLength(1);
+    });
+
+    describe('Curated and User-Edited Personal Knowledge Protection', function () {
+      it('should protect manually created facts from automatic corroboration, updating, or evidence attachment', async function () {
+        const dbName = createUniqueDbName('ManualFactProtection');
+        const testDb = trackDb(createEchoDatabase(dbName));
+        await testDb.open();
+
+        await testDb.writingMessages.put({
+          id: 10,
+          platform: 'ChatGPT',
+          text: 'I write simple TypeScript scripts occasionally.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        });
+
+        const manualId = await addManualPersonalKnowledge(
+          {
+            category: 'skills',
+            subject: 'TypeScript',
+            predicate: 'specializes in',
+            value: 'type-level metaprogramming',
+            stability: 'stable',
+            confidence: 'high',
+            importance: 'primary',
+          },
+          testDb
+        );
+
+        const beforeFact = await testDb.personalKnowledge.get(manualId);
+        expect(beforeFact).toBeDefined();
+        const initialUpdatedAt = beforeFact!.updatedAt.getTime();
+        const initialLastConfirmedAt = beforeFact!.lastConfirmedAt.getTime();
+
+        // Advance time slightly
+        await new Promise((r) => setTimeout(r, 15));
+
+        // Incoming extraction draft with matching (category, subject, predicate) but different value
+        const draft: ValidatedKnowledgeDraft = {
+          category: 'skills',
+          subject: ' typescript ',
+          predicate: ' specializes in ',
+          value: 'basic frontend scripts',
+          sourceExcerpt: 'write simple TypeScript scripts',
+          confidence: 'medium',
+          importance: 'secondary',
+          stability: 'evolving',
+        };
+
+        const result = await persistGroundedKnowledge(draft, 10, testDb);
+
+        // Result verification
+        expect(result.knowledgeId).toBe(manualId);
+        expect(result.isNewKnowledge).toBe(false);
+        expect(result.abortedDueToDeletion).toBe(false);
+        expect(result.skippedDueToCurated).toBe(true);
+
+        // Fact state verification: value and timestamps MUST remain untouched
+        const afterFact = await testDb.personalKnowledge.get(manualId);
+        expect(afterFact?.value).toBe('type-level metaprogramming');
+        expect(afterFact?.confidence).toBe('high');
+        expect(afterFact?.importance).toBe('primary');
+        expect(afterFact?.stability).toBe('stable');
+        expect(afterFact?.sourceType).toBe('manual');
+        expect(afterFact?.updatedAt.getTime()).toBe(initialUpdatedAt);
+        expect(afterFact?.lastConfirmedAt.getTime()).toBe(initialLastConfirmedAt);
+
+        // Evidence verification: zero evidence rows attached to the manual fact
+        const linkedEvidence = await testDb.knowledgeEvidence
+          .where('knowledgeId')
+          .equals(manualId)
+          .toArray();
+        expect(linkedEvidence).toHaveLength(0);
+
+        // Deduplication verification: no duplicate fact created
+        const allFacts = await testDb.personalKnowledge.toArray();
+        expect(allFacts).toHaveLength(1);
+      });
+
+      it('should protect user-edited extracted facts from automatic corroboration, updating, or evidence attachment', async function () {
+        const dbName = createUniqueDbName('UserEditedFactProtection');
+        const testDb = trackDb(createEchoDatabase(dbName));
+        await testDb.open();
+
+        await testDb.writingMessages.put({
+          id: 20,
+          platform: 'ChatGPT',
+          text: 'I am building an extension called Echo.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        });
+        await testDb.writingMessages.put({
+          id: 21,
+          platform: 'ChatGPT',
+          text: 'Echo is an AI tool for writing.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        });
+
+        // Step 1: Initial automatic extraction creates the fact and links evidence from msg 20
+        const draft1: ValidatedKnowledgeDraft = {
+          category: 'projects',
+          subject: 'Echo',
+          predicate: 'is building',
+          value: 'an extension',
+          sourceExcerpt: 'building an extension called Echo',
+          confidence: 'high',
+          importance: 'primary',
+          stability: 'evolving',
+        };
+
+        const res1 = await persistGroundedKnowledge(draft1, 20, testDb);
+        expect(res1.isNewKnowledge).toBe(true);
+
+        // Step 2: User manually edits the fact
+        const fixedEditedTime = new Date('2026-05-01T12:00:00.000Z');
+        await testDb.personalKnowledge.update(res1.knowledgeId, {
+          value: 'autonomous local-first AI writing partner',
+          editedByUser: true,
+          updatedAt: fixedEditedTime,
+          lastConfirmedAt: fixedEditedTime,
+        });
+
+        // Step 3: Message 21 arrives with matching fact
+        const draft2: ValidatedKnowledgeDraft = {
+          category: 'projects',
+          subject: 'echo',
+          predicate: 'is building',
+          value: 'an AI tool for writing',
+          sourceExcerpt: 'Echo is an AI tool for writing',
+          confidence: 'high',
+          importance: 'primary',
+          stability: 'stable',
+        };
+
+        const res2 = await persistGroundedKnowledge(draft2, 21, testDb);
+
+        // Must be identified as skipped due to curation
+        expect(res2.knowledgeId).toBe(res1.knowledgeId);
+        expect(res2.isNewKnowledge).toBe(false);
+        expect(res2.skippedDueToCurated).toBe(true);
+
+        // Fact state verification: user's value and timestamps preserved
+        const fact = await testDb.personalKnowledge.get(res1.knowledgeId);
+        expect(fact?.value).toBe('autonomous local-first AI writing partner');
+        expect(fact?.editedByUser).toBe(true);
+        expect(fact?.sourceType).toBe('extracted');
+        expect(fact?.updatedAt.toISOString()).toBe(fixedEditedTime.toISOString());
+        expect(fact?.lastConfirmedAt.toISOString()).toBe(fixedEditedTime.toISOString());
+
+        // Evidence verification: only the original evidence from msg 20 exists, msg 21 was NOT added
+        const evidence = await testDb.knowledgeEvidence
+          .where('knowledgeId')
+          .equals(res1.knowledgeId)
+          .toArray();
+        expect(evidence).toHaveLength(1);
+        expect(evidence[0]?.messageId).toBe(20);
+
+        // No duplicate fact created
+        const count = await testDb.personalKnowledge.count();
+        expect(count).toBe(1);
+      });
+
+      it('should protect legacy facts without sourceType when editedByUser is true', async function () {
+        const dbName = createUniqueDbName('LegacyEditedFactProtection');
+        const testDb = trackDb(createEchoDatabase(dbName));
+        await testDb.open();
+
+        await testDb.writingMessages.put({
+          id: 30,
+          platform: 'ChatGPT',
+          text: 'I use Neovim as my daily editor.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        });
+
+        const fixedTimestamp = new Date('2026-01-15T08:00:00.000Z');
+        const legacyId = (await testDb.personalKnowledge.add({
+          category: 'preferences',
+          subject: 'Editor',
+          predicate: 'uses',
+          value: 'Neovim with Lua plugins',
+          stability: 'stable',
+          status: 'active',
+          freshnessState: 'fresh',
+          confidence: 'high',
+          importance: 'primary',
+          // Note: sourceType is undefined (legacy pre-curation fact)
+          editedByUser: true,
+          createdAt: fixedTimestamp,
+          updatedAt: fixedTimestamp,
+          lastConfirmedAt: fixedTimestamp,
+        })) as number;
+
+        const draft: ValidatedKnowledgeDraft = {
+          category: 'preferences',
+          subject: 'editor',
+          predicate: 'uses',
+          value: 'Neovim',
+          sourceExcerpt: 'use Neovim as my daily editor',
+          confidence: 'high',
+          importance: 'secondary',
+          stability: 'stable',
+        };
+
+        const result = await persistGroundedKnowledge(draft, 30, testDb);
+        expect(result.skippedDueToCurated).toBe(true);
+        expect(result.isNewKnowledge).toBe(false);
+
+        const fact = await testDb.personalKnowledge.get(legacyId);
+        expect(fact?.value).toBe('Neovim with Lua plugins');
+        expect(fact?.updatedAt.toISOString()).toBe(fixedTimestamp.toISOString());
+        expect(fact?.lastConfirmedAt.toISOString()).toBe(fixedTimestamp.toISOString());
+
+        const evidence = await testDb.knowledgeEvidence.where('knowledgeId').equals(legacyId).toArray();
+        expect(evidence).toHaveLength(0);
+
+        expect(await testDb.personalKnowledge.count()).toBe(1);
+      });
+
+      it('should continue to corroborate legacy facts without sourceType when editedByUser is false or undefined', async function () {
+        const dbName = createUniqueDbName('LegacyUneditedCorroboration');
+        const testDb = trackDb(createEchoDatabase(dbName));
+        await testDb.open();
+
+        await testDb.writingMessages.put({
+          id: 35,
+          platform: 'ChatGPT',
+          text: 'I use PostgreSQL for relational storage.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        });
+
+        const initialTime = new Date('2026-01-01T00:00:00.000Z');
+        const legacyId = (await testDb.personalKnowledge.add({
+          category: 'skills',
+          subject: 'PostgreSQL',
+          predicate: 'uses',
+          value: 'relational database',
+          stability: 'stable',
+          status: 'active',
+          freshnessState: 'fresh',
+          confidence: 'high',
+          importance: 'primary',
+          // sourceType undefined, editedByUser undefined
+          createdAt: initialTime,
+          updatedAt: initialTime,
+          lastConfirmedAt: initialTime,
+        })) as number;
+
+        await new Promise((r) => setTimeout(r, 15));
+
+        const draft: ValidatedKnowledgeDraft = {
+          category: 'skills',
+          subject: 'PostgreSQL',
+          predicate: 'uses',
+          value: 'relational storage',
+          sourceExcerpt: 'use PostgreSQL for relational storage',
+          confidence: 'high',
+          importance: 'primary',
+          stability: 'stable',
+        };
+
+        const result = await persistGroundedKnowledge(draft, 35, testDb);
+        expect(result.isNewKnowledge).toBe(false);
+        expect(result.skippedDueToCurated).toBeUndefined();
+
+        const fact = await testDb.personalKnowledge.get(legacyId);
+        expect(fact?.lastConfirmedAt.getTime()).toBeGreaterThan(initialTime.getTime());
+        expect(fact?.updatedAt.getTime()).toBeGreaterThan(initialTime.getTime());
+
+        const evidence = await testDb.knowledgeEvidence.where('knowledgeId').equals(legacyId).toArray();
+        expect(evidence).toHaveLength(1);
+        expect(evidence[0]?.messageId).toBe(35);
+      });
+
+      it('should continue to corroborate ordinary, unedited extracted facts', async function () {
+        const dbName = createUniqueDbName('OrdinaryCorroboration');
+        const testDb = trackDb(createEchoDatabase(dbName));
+        await testDb.open();
+
+        await testDb.writingMessages.put({
+          id: 40,
+          platform: 'ChatGPT',
+          text: 'I love writing clean tests with Vitest.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        });
+        await testDb.writingMessages.put({
+          id: 41,
+          platform: 'ChatGPT',
+          text: 'Vitest is fast and runs tests in parallel.',
+          createdAt: new Date(),
+          capturedAt: new Date(),
+          trainingStatus: 'pending',
+        });
+
+        const draft1: ValidatedKnowledgeDraft = {
+          category: 'preferences',
+          subject: 'Vitest',
+          predicate: 'prefers for',
+          value: 'testing',
+          sourceExcerpt: 'love writing clean tests with Vitest',
+          confidence: 'high',
+          importance: 'secondary',
+          stability: 'stable',
+        };
+
+        const res1 = await persistGroundedKnowledge(draft1, 40, testDb);
+        expect(res1.isNewKnowledge).toBe(true);
+
+        const firstFact = await testDb.personalKnowledge.get(res1.knowledgeId);
+        expect(firstFact?.sourceType).toBe('extracted');
+        expect(firstFact?.editedByUser).toBe(false);
+        const firstConfirmedTime = firstFact!.lastConfirmedAt.getTime();
+
+        await new Promise((r) => setTimeout(r, 15));
+
+        const draft2: ValidatedKnowledgeDraft = {
+          category: 'preferences',
+          subject: 'vitest',
+          predicate: 'prefers for',
+          value: 'fast parallel testing',
+          sourceExcerpt: 'Vitest is fast and runs tests in parallel',
+          confidence: 'high',
+          importance: 'primary',
+          stability: 'stable',
+        };
+
+        const res2 = await persistGroundedKnowledge(draft2, 41, testDb);
+        expect(res2.isNewKnowledge).toBe(false);
+        expect(res2.skippedDueToCurated).toBeUndefined();
+
+        const updatedFact = await testDb.personalKnowledge.get(res1.knowledgeId);
+        expect(updatedFact?.lastConfirmedAt.getTime()).toBeGreaterThan(firstConfirmedTime);
+        expect(updatedFact?.updatedAt.getTime()).toBeGreaterThan(firstConfirmedTime);
+
+        // Both evidence records attached
+        const evidence = await testDb.knowledgeEvidence
+          .where('knowledgeId')
+          .equals(res1.knowledgeId)
+          .toArray();
+        expect(evidence).toHaveLength(2);
+        expect(evidence[0]?.messageId).toBe(40);
+        expect(evidence[1]?.messageId).toBe(41);
+
+        expect(await testDb.personalKnowledge.count()).toBe(1);
+      });
+
+      it('should integrate with extractKnowledgeFromMessage and record duplicate count without modifying curated facts', async function () {
+        const dbName = createUniqueDbName('ExtractMessageIntegration');
+        const testDb = trackDb(createEchoDatabase(dbName));
+        await testDb.open();
+
+        const manualId = await addManualPersonalKnowledge(
+          {
+            category: 'skills',
+            subject: 'Rust',
+            predicate: 'knows',
+            value: 'async and tokio concurrency',
+            stability: 'stable',
+            confidence: 'high',
+            importance: 'primary',
+          },
+          testDb
+        );
+
+        const msgId = (await saveWritingMessage(
+          {
+            platform: 'ChatGPT',
+            text: 'I know Rust and systems programming thoroughly.',
+            createdAt: new Date(),
+            capturedAt: new Date(),
+            trainingStatus: 'pending',
+          },
+          undefined,
+          testDb
+        ))!;
+
+        // Mock Ollama to return a draft for this exact skill
+        vi.spyOn(ollamaClient, 'queryOllamaJson').mockResolvedValue(
+          JSON.stringify({
+            knowledge: [
+              {
+                category: 'skills',
+                subject: 'Rust',
+                predicate: 'knows',
+                value: 'systems programming',
+                sourceExcerpt: 'I know Rust and systems programming',
+                confidence: 'high',
+                importance: 'secondary',
+                stability: 'stable',
+              },
+            ],
+          })
+        );
+
+        const sourceMessage = (await testDb.writingMessages.get(msgId))!;
+        const result = await extractKnowledgeFromMessage(sourceMessage, { targetDb: testDb });
+
+        expect(result.outcome).toBe('extracted');
+        expect(result.extractedCount).toBe(0);
+        expect(result.duplicateCount).toBe(1);
+
+        // Manual fact must remain completely unchanged
+        const fact = await testDb.personalKnowledge.get(manualId);
+        expect(fact?.value).toBe('async and tokio concurrency');
+
+        // Zero evidence records attached
+        const evidence = await testDb.knowledgeEvidence.where('knowledgeId').equals(manualId).toArray();
+        expect(evidence).toHaveLength(0);
+
+        // No new fact created
+        expect(await testDb.personalKnowledge.count()).toBe(1);
+      });
     });
   });
 

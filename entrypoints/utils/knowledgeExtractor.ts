@@ -653,6 +653,7 @@ export interface PersistGroundedKnowledgeResult {
   knowledgeId: number;
   isNewKnowledge: boolean;
   abortedDueToDeletion?: boolean;
+  skippedDueToCurated?: boolean;
 }
 
 export type ExtractionOutcome = 'extracted' | 'empty' | 'aborted_deleted';
@@ -719,6 +720,18 @@ export async function persistGroundedKnowledge(
       let isNewKnowledge = false;
 
       if (existingItem && existingItem.id !== undefined) {
+        // Protection check: Curated (manual) or user-edited facts must NEVER be modified,
+        // receive new evidence, or have their timestamps updated by automatic extraction.
+        const isCurated = existingItem.sourceType === 'manual' || existingItem.editedByUser === true;
+        if (isCurated) {
+          return {
+            knowledgeId: existingItem.id,
+            isNewKnowledge: false,
+            abortedDueToDeletion: false,
+            skippedDueToCurated: true,
+          };
+        }
+
         // Corroborate existing knowledge
         targetKnowledgeId = existingItem.id;
 
@@ -756,6 +769,8 @@ export async function persistGroundedKnowledge(
           freshnessState: 'fresh',
           confidence: draft.confidence,
           importance: draft.importance,
+          sourceType: 'extracted',
+          editedByUser: false,
           createdAt: now,
           updatedAt: now,
           lastConfirmedAt: now,
