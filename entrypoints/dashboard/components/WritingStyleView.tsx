@@ -22,11 +22,8 @@ import {
   type WritingMessage,
 } from '../../utils/database';
 import {
-  isPotentialStyleSample,
+  isEligibleStyleSample,
 } from '../../utils/trainingFilter';
-import {
-  classifyContent,
-} from '../../utils/contentClassifier';
 import {
   checkGenerationServiceHealth,
   type GenerationServiceHealth,
@@ -73,28 +70,15 @@ export function WritingStyleView({ onNavigate }: WritingStyleViewProps) {
   const [isSampleModalOpen, setIsSampleModalOpen] = useState(false);
   const [selectedBenchmarkIndex, setSelectedBenchmarkIndex] = useState(0);
 
-  // Load writing messages from local IndexedDB with verified training eligibility filtering
+  // Load writing messages from local IndexedDB with canonical style eligibility filtering
   const loadData = useCallback(async () => {
     setIsLoadingMessages(true);
     try {
       const allMsgs = await getWritingMessages();
-      // Apply existing content-classification and style-eligibility utilities:
-      // Exclude code, terminal output, structured data, external content, agent directives, and ambiguous fragments.
-      // Only retain authentic personal prose (Tier A) and authentic technical prose (Tier B).
-      const eligibleMsgs = allMsgs.filter((m) => {
-        if (!m.text || typeof m.text !== 'string' || !m.text.trim()) {
-          return false;
-        }
-        if (!isPotentialStyleSample(m.text)) {
-          return false;
-        }
-        const classification = classifyContent(m.text);
-        const isEligibleTier =
-          classification.tier === 'tier_a' || classification.tier === 'tier_b';
-        const isStrongProse =
-          classification.contentType === 'prose' && classification.styleSignal === 'strong';
-        return isEligibleTier && isStrongProse;
-      });
+      // Apply canonical style-eligibility predicate:
+      // Excludes code, terminal output, structured data, external content, agent directives, reports, and ambiguous fragments.
+      // Only retains authentic personal prose (Tier A) and authentic technical prose (Tier B).
+      const eligibleMsgs = allMsgs.filter((m) => isEligibleStyleSample(m.text));
       setMessages(eligibleMsgs);
     } catch (err) {
       console.warn('Echo: Could not load writing messages:', err);

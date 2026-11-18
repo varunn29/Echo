@@ -1,6 +1,10 @@
 import Dexie, { type EntityTable } from 'dexie';
 import { classifyContent } from './contentClassifier';
-import { isPotentialStyleSample, isEligibleTrainingSample } from './trainingFilter';
+import {
+  isPotentialStyleSample,
+  isEligibleStyleSample,
+  isEligibleTrainingSample,
+} from './trainingFilter';
 
 type KnowledgeCategory =
   | 'projects'
@@ -806,9 +810,17 @@ async function getTrainingReadiness(
   for (const message of pendingMessages) {
     const text = message.text;
 
+    // Canonical single source of truth for style-training eligibility
+    if (isEligibleStyleSample(text)) {
+      eligibleSamples.push(message);
+      continue;
+    }
+
+    // Message is excluded — record in diagnostic breakdown counters
+    breakdown.totalExcluded++;
+
     if (!isPotentialStyleSample(text)) {
       breakdown.nonContent++;
-      breakdown.totalExcluded++;
       continue;
     }
 
@@ -816,21 +828,14 @@ async function getTrainingReadiness(
 
     if (classification.contentType === 'code') {
       breakdown.code++;
-      breakdown.totalExcluded++;
     } else if (classification.contentType === 'terminal') {
       breakdown.terminal++;
-      breakdown.totalExcluded++;
     } else if (classification.contentType === 'structured_data') {
       breakdown.structuredData++;
-      breakdown.totalExcluded++;
     } else if (classification.contentType === 'short_fragment') {
       breakdown.shortFragment++;
-      breakdown.totalExcluded++;
-    } else if (classification.styleSignal !== 'strong') {
-      breakdown.weakOrNoStyle++;
-      breakdown.totalExcluded++;
     } else {
-      eligibleSamples.push(message);
+      breakdown.weakOrNoStyle++;
     }
   }
 
@@ -861,6 +866,7 @@ export {
   getKnowledgeEvidence,
   getEvidenceByMessageId,
   getTrainingReadiness,
+  isEligibleStyleSample,
   isEligibleTrainingSample,
   DEFAULT_DUPLICATE_WINDOW_MS,
   DEFAULT_TRAINING_READINESS_THRESHOLD,

@@ -44,12 +44,15 @@ export const CLASSIFICATION_REASON_CODES = {
   AGENT_DIRECTIVE_HEADING: 'agent_directive_heading',
   AGENT_DIRECTIVE_COMMAND: 'agent_directive_command',
   AGENT_STRUCTURED_TEMPLATE: 'agent_structured_template',
+  AGENT_EXECUTION_REPORT: 'agent_execution_report',
+  AGENT_GIT_WORKFLOW_DIRECTIVE: 'agent_git_workflow_directive',
 
   // Tier D: Terminal, Logs, Code, Data, Fragments
   TERMINAL_POWERSHELL_PROMPT: 'terminal_powershell_prompt',
   TERMINAL_WINDOWS_CMD_PROMPT: 'terminal_windows_cmd_prompt',
   TERMINAL_POSIX_PROMPT: 'terminal_posix_prompt',
   TERMINAL_BUILD_LOG: 'terminal_build_log',
+  TERMINAL_MODEL_EXECUTION_LOG: 'terminal_model_execution_log',
   TERMINAL_TEST_RUNNER_OUTPUT: 'terminal_test_runner_output',
   TERMINAL_PACKAGE_MANAGER_OUTPUT: 'terminal_package_manager_output',
   TERMINAL_STACK_TRACE: 'terminal_stack_trace',
@@ -66,6 +69,8 @@ export const CLASSIFICATION_REASON_CODES = {
   EXTERNAL_VIDEO_SCRIPT: 'external_video_script',
   EXTERNAL_SOCIAL_TAGS: 'external_social_tags',
   EXTERNAL_SCRAPED_DASHBOARD: 'external_scraped_dashboard',
+  EXTERNAL_APPLICATION_OR_FORM: 'external_application_or_form',
+  EXTERNAL_SCRAPED_UI: 'external_scraped_ui',
 
   // Tier F: Mixed or Ambiguous Content
   MIXED_PROSE_AND_CODE: 'mixed_prose_and_code',
@@ -239,7 +244,7 @@ const CONVERSATIONAL_FRAGMENTS = new Set([
 
 export const PERSONAL_EXPERIENCE_PATTERNS = [
   // 1. Projects and experiences
-  /\b(I|we)\b[\w\s]{0,20}\b(started by|started with|started learning|been learning|learned|learning|studying|studied|picked up|working on|working with)\b/i,
+  /\b(I|we)\b[\w\s]{0,20}\b(started by|started with|started learning|been learning|learned|learning|studying|studied|picked up|working on|working with|been exploring|exploring)\b/i,
   /\b(I|we)\b[\w\s]{0,20}\b(built|building|created|creating|developed|developing|designed|designing|implemented|implementing|deployed|deploying)\b/i,
   /\b(my|our)\s+(first\s+)?(project|app|application|platform|startup|product|website|repo|codebase|company|team|client|job|role|interview|career)\b/i,
   /\b(I|we)\s+(worked\s+at|worked\s+for|interned\s+at|interviewed\s+with|applied\s+to|applying\s+to)\b/i,
@@ -261,6 +266,7 @@ export const PERSONAL_EXPERIENCE_PATTERNS = [
 
   // 5. Personal opinions, values and behavioral tendencies
   /\b(frustrates\s+me|I\s+just\s+hate|I\s+hate|I\s+really\s+like|I\s+love|I\s+prefer|I\s+value|in\s+my\s+opinion|from\s+my\s+experience|I\s+strongly\s+believe|my\s+take\s+on\s+this\s+is|I\s+believe\s+good\s+software|I\s+enjoy\s+building)\b/i,
+  /\b(in\s+my\s+experience|from\s+what\s+I\s+have\s+seen|I\s+have\s+noticed|I\s+noticed|my\s+observation\s+is)\b/i,
   /\b(if\s+I\s+have\s+enough\s+knowledge|if\s+I\s+know\s+enough|when\s+I\s+disagree|in\s+disagreements|I\s+will\s+argue|I\s+will\s+put\s+my\s+point|listen\s+to\s+theirs)\b/i,
   /\b(my\s+approach\s+is|my\s+tendency\s+is|my\s+philosophy\s+is|how\s+I\s+approach)\b/i,
 
@@ -272,7 +278,8 @@ export const PERSONAL_EXPERIENCE_PATTERNS = [
 ];
 
 export const DECLARATIVE_PERSONAL_STATEMENTS = [
-  /\b(recently\s+|so\s+)?I\s+(built|created|developed|designed|implemented|deployed|worked|interned|applied)\b/i,
+  /\b(recently\s+|so\s+)?I\s+(have\s+been\s+exploring|have\s+been\s+working|built|created|developed|designed|implemented|deployed|worked|interned|applied)\b/i,
+  /\bI\s+(have\s+noticed|noticed|observed|found\s+that)\b/i,
   /\bI\s+(started\s+by\s+learning|learned|studied|picked\s+up|been\s+learning)\b/i,
   /\bI\s+(usually|always|typically|often|prefer\s+using|rely\s+on)\b/i,
   /\b(frustrates\s+me|I\s+hate|I\s+love|I\s+value|in\s+my\s+opinion|my\s+plan\s+was|I\s+enjoy\s+building|I\s+prefer\s+software)\b/i,
@@ -288,7 +295,8 @@ export const DECLARATIVE_PERSONAL_STATEMENTS = [
 
 // Patterns indicative of authentic technical discussion in user voice
 const TECHNICAL_PROSE_PATTERNS = [
-  /\b(architecture|database|adapter|model|service|token|worker|offscreen|IndexedDB|LevelDB|process|pipeline|transaction|component)\b/i,
+  /\b(architecture|architectural|database|adapter|model|service|token|worker|offscreen|IndexedDB|LevelDB|process|pipeline|transaction|component|repository|repositories|code\s+reviews?)\b/i,
+  /\b(unit\s+tests?|test\s+suites?|integration\s+tests?|invariants|refactoring|boundary\s+conditions)\b/i,
   /\b(we\s+will\s+write\s+tests|run\s+the\s+test\s+command|code\s+will\s+run\s+against|check\s+whether\s+it\s+works|breaks\s+the\s+functionality)\b/i,
   /\b(asynchronous\s+event-driven|connection\s+pooling|dependency\s+injection|type\s+alias|state\s+management|client-side|server-side)\b/i,
   /\b(git\s+branching\s+strategies|deployment\s+pipeline|re-renders|microtask\s+queue|concurrency|local-first)\b/i,
@@ -365,13 +373,17 @@ function detectTerminalPromptOrCommand(text: string): { isTerminal: boolean; rea
   if (lines.length === 0) return { isTerminal: false };
 
   // 1. Multi-platform Shell Prompts (Windows PowerShell, CMD, POSIX, Virtualenv)
-  // Checked on first line or any prompt-like line
-  const psPromptRegex = /^(PS\s+[A-Za-z]:\\|PS>)/i;
+  // Checked across all non-empty lines
+  const psPromptRegex = /^(\([a-zA-Z0-9_.-]+\)\s+)?(P?S\s+[A-Za-z]:\\|PS>)/i;
   const cmdPromptRegex = /^[A-Za-z]:\\[^>]*>/i;
   const posixPromptRegex = /^([$>]\s+|[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+:.*[$#]\s+|\([a-zA-Z0-9_.-]+\)\s+[a-zA-Z0-9_.-]+@|#\s+(apt|yum|systemctl|docker|npm|pnpm|yarn|git|cd|ls|rm|chmod|chown)\b)/i;
 
+  if (/Windows PowerShell.*Copyright \(C\) Microsoft Corporation/i.test(trimmed)) {
+    return { isTerminal: true, reasonCode: CLASSIFICATION_REASON_CODES.TERMINAL_POWERSHELL_PROMPT };
+  }
+
   for (const line of lines) {
-    if (psPromptRegex.test(line)) {
+    if (psPromptRegex.test(line) || /\bPS\s+[A-Za-z]:\\/i.test(line)) {
       return { isTerminal: true, reasonCode: CLASSIFICATION_REASON_CODES.TERMINAL_POWERSHELL_PROMPT };
     }
     if (cmdPromptRegex.test(line)) {
@@ -383,9 +395,10 @@ function detectTerminalPromptOrCommand(text: string): { isTerminal: boolean; rea
   }
 
   // 2. PowerShell Cmdlets (Get-Process, Select-Object, Where-Object, etc.)
-  const firstLine = lines[0] || '';
-  if (/^(Get|Set|New|Remove|Start|Stop|Invoke|Test|Enable|Disable|Select|Where|ForEach|Measure|Sort|Group)-[a-zA-Z]+\b/i.test(firstLine)) {
-    return { isTerminal: true, reasonCode: CLASSIFICATION_REASON_CODES.TERMINAL_POWERSHELL_PROMPT };
+  for (const line of lines) {
+    if (/^(Get|Set|New|Remove|Start|Stop|Invoke|Test|Enable|Disable|Select|Where|ForEach|Measure|Sort|Group)-[a-zA-Z]+\b/i.test(line) || /\bGet-Process\b/i.test(line)) {
+      return { isTerminal: true, reasonCode: CLASSIFICATION_REASON_CODES.TERMINAL_POWERSHELL_PROMPT };
+    }
   }
 
   // 3. PowerShell continuation prompt (>>)
@@ -394,6 +407,7 @@ function detectTerminalPromptOrCommand(text: string): { isTerminal: boolean; rea
   }
 
   // 4. CLI tool commands on first line (e.g. npm install, git status)
+  const firstLine = lines[0] || '';
   const tokens = firstLine.split(/\s+/);
   const firstToken = tokens[0]?.toLowerCase().replace(/[\\/].*[\\/]/, '') || '';
 
@@ -451,6 +465,13 @@ function detectBuildOrPackageLog(text: string): { isBuildLog: boolean; reasonCod
     { pattern: /\bTest\s+Files\s+\d+\s+passed\b/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_TEST_RUNNER_OUTPUT },
     { pattern: /\bTests\s+\d+\s+passed\b/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_TEST_RUNNER_OUTPUT },
     { pattern: /DEV\s+v\d+\.\d+\.\d+\s+[A-Za-z]:\//i, code: CLASSIFICATION_REASON_CODES.TERMINAL_TEST_RUNNER_OUTPUT },
+
+    // Model and server execution logs (Ollama, llama.cpp, Python runner)
+    { pattern: /\bslot launch_slot_:\s*id\s+\d+/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_MODEL_EXECUTION_LOG },
+    { pattern: /\bsampler params:\s*repeat_last_n/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_MODEL_EXECUTION_LOG },
+    { pattern: /\bmirostat\s*=\s*\d+/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_MODEL_EXECUTION_LOG },
+    { pattern: /\badaptive_target\s*=\s*[-0-9.]+/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_MODEL_EXECUTION_LOG },
+    { pattern: /\bprompt eval time\s*=\s*[\d.]+\s*ms/i, code: CLASSIFICATION_REASON_CODES.TERMINAL_MODEL_EXECUTION_LOG },
   ];
 
   for (const sig of buildAndPackageSignatures) {
@@ -468,28 +489,96 @@ function detectBuildOrPackageLog(text: string): { isBuildLog: boolean; reasonCod
 function detectAgentDirectiveOrTemplate(text: string): { isAgentPrompt: boolean; reasonCode?: string } {
   const trimmed = text.trim();
 
-  // 1. Prominent Project / Agent Headings (e.g. "# Echo — Final Collection Resilience Review")
-  if (/^#+\s*(Echo\s*[\u2014\-]|(Task|Objective|Audit|Review|Implementation|Instructions|Requirements|Preflight|Read-Only)\b)/im.test(trimmed)) {
+  // 1. Structured multi-section task scaffolding:
+  const hasTaskSection = /\b(Objective|Task|Requirements|Tasks|Instructions)\s*:\s*/i.test(trimmed);
+  const hasOutcomeSection = /\b(Deliverables|Restrictions|Verification|Steps|Acceptance Criteria)\s*:\s*/i.test(trimmed);
+  if (hasTaskSection && hasOutcomeSection) {
+    return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_STRUCTURED_TEMPLATE };
+  }
+
+  if (
+    /(^|\n)\s*##\s+1\.\s+[\s\S]*(^|\n)\s*##\s+2\.\s+/im.test(trimmed) ||
+    /(^|\n)\s*Step\s+1:\s+[\s\S]*(^|\n)\s*Step\s+2:\s+/im.test(trimmed)
+  ) {
+    return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_STRUCTURED_TEMPLATE };
+  }
+
+  // 2. Prominent Project / Agent Headings (with or without markdown '#')
+  const headerRegex =
+    /^(#+\s*)?(Echo\s*[\u2014\-]|(Task|Objective|Audit|Review|Implementation|Instructions|Requirements|Preflight|Read-Only|Verification)\b)/im;
+  if (headerRegex.test(trimmed)) {
+    if (/^#+\s*/.test(trimmed)) {
+      return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_DIRECTIVE_HEADING };
+    }
+    if (/\b(Report|Audit|Verification|Summary|Review)\b/i.test(trimmed.slice(0, 150))) {
+      return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_EXECUTION_REPORT };
+    }
     return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_DIRECTIVE_HEADING };
   }
 
-  // 2. Directives commanding an AI assistant
+  // 2. Report titles and verification summaries without '#':
+  if (
+    /^(#+\s*)?([A-Za-z0-9_-]+\s*[\u2014\-:]\s*)?(Personal Writing Dataset|Local LoRA|Local Generation Service|Evaluation Integrity|Database Integrity|Post-Push Verification|Investigation Report|Implementation & Verification|Message Collection Pipeline|Code Review|Verification Report|Technical Report)\b/im.test(
+      trimmed
+    ) ||
+    /\b(Investigation Report|Post-Push Verification Report|Verification Summary|Root Cause Analysis|Technical Report:|Git Commit Report|Code Review & Git Commit|Verification Report|Implementation Report|Audit Report|Review Report)\b/im.test(
+      trimmed
+    )
+  ) {
+    return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_EXECUTION_REPORT };
+  }
+
+  // 3. Assistant execution & progress reporting phrasing:
+  if (
+    /\bI have (initiated|launched|executed|verified|inspected|completed|updated|run)\b[\w\s]{0,40}\b(test|script|adapter|training|service|build|audit|inspection|command|commit|process)\b/i.test(
+      trimmed
+    ) ||
+    /\bWe have (inspected|verified|completed|reviewed|approved|audited|analyzed)\b[\w\s]{0,40}\b(dataset|messages|codebase|commit|audit|pipeline|records|changes)\b/i.test(
+      trimmed
+    ) ||
+    /\bI will wait for (inference|training|execution|completion|the script|the command) to finish\b/i.test(trimmed)
+  ) {
+    return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_EXECUTION_REPORT };
+  }
+
+  // 4. Git workflow / commit directives:
+  if (
+    /\b(Stage exactly these \d+ files|Create the commit using (this exact message|message)|Push the already verified Commit \d+|Do a (final )?read-only Git status verification|local main and origin\/main are synchronized|Verify the current branch is main|Files to stage:)\b/i.test(
+      trimmed
+    ) ||
+    /\b(feat|fix|test|chore|refactor|docs)\([a-z-]+\):\s+/i.test(trimmed) ||
+    /\b(Run git status --short|git diff --cached --name-only|git push origin main)\b/i.test(trimmed)
+  ) {
+    return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_GIT_WORKFLOW_DIRECTIVE };
+  }
+
+  // 5. Strict safety restrictions, constraints, and pre-commit checks:
+  if (
+    /\b(STRICT RESTRICTIONS|Strict safety restrictions|Required output|Zero training steps must be executed|Wait for explicit approval|READ-ONLY investigation|Do not modify any files|Do not execute training|Target configuration|Pre-Implementation Safety Audit)\b/i.test(
+      trimmed
+    ) ||
+    /\b(Before committing|Pre-commit (safety )?verification|Verification checklist|Verification tasks|Acceptance criteria)\b/i.test(
+      trimmed
+    )
+  ) {
+    return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_DIRECTIVE_COMMAND };
+  }
+
+  // 6. Directives commanding an AI assistant / system prompts / few-shot prompts:
   const commandPatterns = [
     /^(Perform\s+a\s+(strictly\s+)?(read-only|READ-ONLY|FINAL)\s+(pre-commit\s+)?(review|audit)|Prepare\s+the\s+approved\s+Echo\s+changes|Push\s+the\s+existing\s+commit|Phase\s+\d+\s+Step\s+\d+|Read-Only\s+Audit:|Review\s+the\s+following|Audit\s+the\s+implementation|Inspect\s+the\s+codebase|Verify\s+the\s+following\s+requirements|Please\s+verify\s+all|Check\s+whether\s+the\s+following)/im,
-    /\b(Strict\s+safety\s+restrictions|Required\s+output|Zero\s+training\s+steps\s+must\s+be\s+executed|Wait\s+for\s+explicit\s+approval|READ-ONLY\s+investigation\s+only|Do\s+not\s+modify\s+any\s+files|Do\s+not\s+execute\s+training|Target\s+configuration|Pre-Implementation\s+Safety\s+Audit)\b/i,
-    /^(Target|Task|Objective|Instructions|Requirements|Deliverables|Context|Verification|Pre-Implementation\s+Safety\s+Audit):\s*$/im,
-    /^I\s+approve\s+Path\s+\d+:\s+/im,
+    /^(Target|Task|Objective|Instructions|Requirements|Deliverables|Context|Verification|Restrictions|Acceptance Criteria|Pre-Implementation\s+Safety\s+Audit):\s*$/im,
+    /\bI approve (Path \d+|the proposed)\b/im,
+    /\b(The implementation audit looks good|Continue the existing Echo project|Make only the following formatting corrections in the staged Echo changes)\b/i,
+    /\b(You are a (personal )?writing assistant|Act as a|You are an expert)\b/i,
+    /\b(Read the conversation below and extract|Read the conversation and extract|Extract ALL personal information from the conversation)\b/i,
+    /\b(Study these (two )?writing styles|First, study the writing samples below|Writing samples:\s*\n\s*1\.|STYLE A:\s*|STYLE B:\s*)\b/i,
   ];
 
   for (const cp of commandPatterns) {
     if (cp.test(trimmed)) {
       return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_DIRECTIVE_COMMAND };
     }
-  }
-
-  // 3. Multi-heading task scaffolding (## 1. ... ## 2. ...)
-  if (/(^|\n)##\s+1\.\s+[\s\S]*(^|\n)##\s+2\.\s+/im.test(trimmed)) {
-    return { isAgentPrompt: true, reasonCode: CLASSIFICATION_REASON_CODES.AGENT_STRUCTURED_TEMPLATE };
   }
 
   return { isAgentPrompt: false };
@@ -517,6 +606,31 @@ function detectExternalContent(text: string): { isExternal: boolean; reasonCode?
   // Repeated hashtags
   if (/#\w+\s+#\w+\s+#\w+/i.test(text)) {
     return { isExternal: true, reasonCode: CLASSIFICATION_REASON_CODES.EXTERNAL_SOCIAL_TAGS };
+  }
+
+  // Application forms, fellowship applications, profile builder forms
+  if (
+    /\b(Fellowship|Founding Cohort|Stage 01 Application|Step \d+ of \d+\s*—\s*Where is your work|Fill out your profile.*Highlight what you're good at|Next,\s+fill out your profile)\b/i.test(
+      text
+    ) ||
+    /\bMozilla Foundation Logo.*Meet Mozilla What We Do Join Us\b/i.test(text)
+  ) {
+    return { isExternal: true, reasonCode: CLASSIFICATION_REASON_CODES.EXTERNAL_APPLICATION_OR_FORM };
+  }
+
+  // Scraped Echo UI / Dashboard text
+  if (
+    /\bEcho\.\s+Writing studio\s+Workspace\s+Dashboard\b/i.test(text) ||
+    /\bDashboardMy Writing DataMy Writing Style\b/i.test(text) ||
+    /\bprojectshigh confidence\b/i.test(text) ||
+    /\bChatGPT\d{1,2}\/\d{1,2}\/\d{4},\s+\d{1,2}:\d{2}:\d{2}\s+(AM|PM)\b/i.test(text)
+  ) {
+    return { isExternal: true, reasonCode: CLASSIFICATION_REASON_CODES.EXTERNAL_SCRAPED_UI };
+  }
+
+  // Video prompt generation instructions
+  if (/\bCreate an? \d+-second vertical 3D animated.*scene\b/i.test(text)) {
+    return { isExternal: true, reasonCode: CLASSIFICATION_REASON_CODES.EXTERNAL_VIDEO_SCRIPT };
   }
 
   return { isExternal: false };
@@ -715,6 +829,23 @@ export function classifyContent(text: string): ContentClassification {
     };
   }
 
+  // AI-Agent Directives & Prompt Templates -> Tier C (Segregated)
+  // Check agent directives before YAML/config so structured prompt specs (Objective: ..., Requirements: ...) are Tier C
+  const agentCheck = detectAgentDirectiveOrTemplate(normalizedText);
+  if (agentCheck.isAgentPrompt) {
+    const code = agentCheck.reasonCode || CLASSIFICATION_REASON_CODES.AGENT_DIRECTIVE_COMMAND;
+    return {
+      contentType: 'prose',
+      styleSignal: 'none',
+      knowledgeSignal: 'none',
+      wordCount,
+      reasons: ['agent_directive_or_prompt_template'],
+      tier: 'tier_c',
+      tierReason: 'AI-agent instruction, audit directive, or prompt template',
+      reasonCodes: [code],
+    };
+  }
+
   if (isYamlOrConfig(normalizedText)) {
     return {
       contentType: 'structured_data',
@@ -758,23 +889,7 @@ export function classifyContent(text: string): ContentClassification {
     };
   }
 
-  // 5. AI-Agent Directives & Prompt Templates -> Tier C (Segregated)
-  const agentCheck = detectAgentDirectiveOrTemplate(normalizedText);
-  if (agentCheck.isAgentPrompt) {
-    const code = agentCheck.reasonCode || CLASSIFICATION_REASON_CODES.AGENT_DIRECTIVE_COMMAND;
-    return {
-      contentType: 'prose',
-      styleSignal: 'none',
-      knowledgeSignal: 'none',
-      wordCount,
-      reasons: ['agent_directive_or_prompt_template'],
-      tier: 'tier_c',
-      tierReason: 'AI-agent instruction, audit directive, or prompt template',
-      reasonCodes: [code],
-    };
-  }
-
-  // 6. Cross-platform terminal shell prompts & commands -> Tier D (Excluded)
+  // 5. Cross-platform terminal shell prompts & commands -> Tier D (Excluded)
   const terminalCheck = detectTerminalPromptOrCommand(normalizedText);
   if (terminalCheck.isTerminal) {
     const code = terminalCheck.reasonCode || CLASSIFICATION_REASON_CODES.TERMINAL_COMMAND_INVOCATION;
@@ -934,24 +1049,9 @@ export function classifyContent(text: string): ContentClassification {
     };
   }
 
-  // General prose check
-  if (wordCount >= 16 && /[.!?]$/.test(normalizedText)) {
-    // Complete grammatical sentence structure
-    reasons.push('natural_language_prose');
-    reasonCodes.push(CLASSIFICATION_REASON_CODES.NATURAL_CONVERSATIONAL_PROSE);
-    return {
-      contentType: 'prose',
-      styleSignal: 'strong',
-      knowledgeSignal: 'none',
-      wordCount,
-      reasons,
-      tier: 'tier_b',
-      tierReason: 'Authentic grammatical conversational prose',
-      reasonCodes,
-    };
-  }
-
   // Ambiguous or weak style prose -> Tier F (Manual Review)
+  // When prose lacks verified personal reflection (Tier A) or authentic technical exposition (Tier B),
+  // quarantine into Tier F rather than automatically treating it as eligible drafting prose.
   reasons.push('natural_language_prose');
   reasonCodes.push(CLASSIFICATION_REASON_CODES.AMBIGUOUS_STYLE_SIGNAL);
   return {

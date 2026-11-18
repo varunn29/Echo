@@ -183,7 +183,7 @@ describe('Training Readiness Foundation (getTrainingReadiness)', function () {
   });
 
   describe('7. Mixed Content Rules', function () {
-    it('should accept mixed content when the prose portion has a strong style signal (14+ words)', async function () {
+    it('should quarantine mixed prose and code into Tier F (not eligible for training readiness)', async function () {
       const strongMixed = createSampleMessage(
         `I am trying to implement a debounce hook in React, but the timer keeps resetting on each render:
 
@@ -204,9 +204,10 @@ How can I persist the timer reference across re-renders without triggering extra
       const result = await getTrainingReadiness(testDb);
 
       expect(result.totalPending).toBe(1);
-      expect(result.eligibleCount).toBe(1);
-      expect(result.eligibleSamples).toHaveLength(1);
-      expect(result.breakdown.totalExcluded).toBe(0);
+      expect(result.eligibleCount).toBe(0);
+      expect(result.eligibleSamples).toHaveLength(0);
+      expect(result.breakdown.weakOrNoStyle).toBe(1);
+      expect(result.breakdown.totalExcluded).toBe(1);
     });
 
     it('should exclude mixed content when the prose portion has a weak style signal (<14 words)', async function () {
@@ -335,6 +336,49 @@ Please fix this issue.`
 
       expect(record3?.trainingStatus).toBe('trained');
       expect(record3?.text).toBe(trainedMessage.text);
+    });
+  });
+
+  describe('10. Cross-Component Eligibility Consistency', function () {
+    it('should produce identical eligibility outcomes across isEligibleStyleSample, isEligibleTrainingSample, and getTrainingReadiness', async function () {
+      const { isEligibleStyleSample, isEligibleTrainingSample } = await import('./trainingFilter');
+
+      const testCases = [
+        // Genuine personal writing
+        'I started by learning HTML, CSS and JavaScript and my plan was to learn web development.',
+        'I enjoy building software tools that solve practical problems. I prefer keeping applications simple and reliable.',
+        'When designing distributed architectures, I prefer local-first data storage because it respects user privacy.',
+        // Antigravity report (false positive)
+        'Echo — Personal Writing Dataset Preparation V1 Report\nWe have inspected the complete set of collected messages from Echo.',
+        'I have initiated the test of the existing fine-tuned LoRA adapter using training/test_adapter.py. I will wait for inference to finish.',
+        // Commit instruction (false positive)
+        'Push the already verified Commit 1 to GitHub. Commit: b640bb4cc7c7bc62df7817bb389a346cd49de620 Steps: Verify the current branch is main.',
+        'Stage exactly these 6 files: 1. entrypoints/utils/database.ts 2. entrypoints/utils/contentClassifier.ts',
+        // Terminal log / server execution log (false positive)
+        'slot launch_slot_: id 0 | task -1 | sampler params: repeat_last_n = 64, repeat_penalty = 1.000',
+        'PS D:\\Forge\\Echo> npm test',
+        // Generic prose without personal or technical style signal (false positive)
+        'The quick brown fox jumps over the lazy dog.',
+      ];
+
+      for (const text of testCases) {
+        const styleEligible = isEligibleStyleSample(text);
+        const trainingEligible = isEligibleTrainingSample(text);
+
+        // Canonical equivalence assertion
+        expect(styleEligible).toBe(trainingEligible);
+
+        // Test database integration
+        const msg = createSampleMessage(text);
+        await testDb.writingMessages.clear();
+        await testDb.writingMessages.add(msg);
+
+        const readiness = await getTrainingReadiness(testDb);
+        const readinessEligible = readiness.eligibleCount === 1;
+
+        expect(readinessEligible).toBe(styleEligible);
+        expect(readiness.eligibleSamples.length).toBe(styleEligible ? 1 : 0);
+      }
     });
   });
 });

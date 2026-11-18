@@ -808,6 +808,126 @@ How can I persist the timer reference across re-renders without triggering extra
         expect(result.tier).toBe('tier_c');
         expect(result.styleSignal).toBe('none');
       });
+
+      it('should classify assistant execution reports into Tier C even if containing first-person phrasing', function () {
+        const report1 =
+          'I have initiated the test of the existing fine-tuned LoRA adapter using training/test_adapter.py. I will wait for inference to finish.';
+        const result1 = classifyContent(report1);
+        expect(result1.tier).toBe('tier_c');
+        expect(result1.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.AGENT_EXECUTION_REPORT);
+
+        const report2 =
+          'Echo — Personal Writing Dataset Preparation V1 Report\nWe have inspected the complete set of collected messages from Echo\'s IndexedDB export.';
+        const result2 = classifyContent(report2);
+        expect(result2.tier).toBe('tier_c');
+        expect(result2.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.AGENT_EXECUTION_REPORT);
+
+        const report3 =
+          'Investigation Report: Personal Knowledge Retrieval Failure\n1. Executive Summary: Item status details.';
+        const result3 = classifyContent(report3);
+        expect(result3.tier).toBe('tier_c');
+        expect(result3.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.AGENT_EXECUTION_REPORT);
+      });
+
+      it('should classify Git commit and push workflow instructions into Tier C', function () {
+        const git1 =
+          'Push the already verified Commit 1 to GitHub.\nCommit: b640bb4cc7c7bc62df7817bb389a346cd49de620\nSteps: Verify current branch is main.';
+        const result1 = classifyContent(git1);
+        expect(result1.tier).toBe('tier_c');
+        expect(result1.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.AGENT_GIT_WORKFLOW_DIRECTIVE);
+
+        const git2 =
+          'We are beginning the Echo commit process, starting with Commit 1 only.\nStage exactly these 6 files: entrypoints/utils/database.ts';
+        const result2 = classifyContent(git2);
+        expect(result2.tier).toBe('tier_c');
+        expect(result2.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.AGENT_GIT_WORKFLOW_DIRECTIVE);
+
+        const git3 =
+          'Commit 1 has been reviewed and approved. Create the commit using this exact message: feat(data): extend personal knowledge curation and harden content classifier';
+        const result3 = classifyContent(git3);
+        expect(result3.tier).toBe('tier_c');
+        expect(result3.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.AGENT_GIT_WORKFLOW_DIRECTIVE);
+      });
+
+      it('should classify structured multi-section task prompts into Tier C', function () {
+        const prompt =
+          'Objective: Perform a strictly read-only baseline generation quality audit.\nRestrictions: Do not modify working code.\nDeliverables: Return structured report.';
+        const result = classifyContent(prompt);
+        expect(result.tier).toBe('tier_c');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.AGENT_STRUCTURED_TEMPLATE);
+      });
+
+      it('should classify model and server execution logs into Tier D', function () {
+        const log =
+          'slot launch_slot_: id 0 | task -1 | sampler params: repeat_last_n = 64, repeat_penalty = 1.000 mirostat = 0, mirostat_lr = 0.100';
+        const result = classifyContent(log);
+        expect(result.tier).toBe('tier_d');
+        expect(result.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.TERMINAL_MODEL_EXECUTION_LOG);
+      });
+
+      it('should classify application forms and scraped UI into Tier E', function () {
+        const form =
+          'YARC markARCBUILDER FELLOWSHIP Founding Cohort · 2027 · Stage 01 Application Step 4 of 7 — Where is your work 57%';
+        const resultForm = classifyContent(form);
+        expect(resultForm.tier).toBe('tier_e');
+        expect(resultForm.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.EXTERNAL_APPLICATION_OR_FORM);
+
+        const ui =
+          'Echo. Writing studio Workspace DashboardMy Writing DataMy Writing Style Preferences Settings';
+        const resultUi = classifyContent(ui);
+        expect(resultUi.tier).toBe('tier_e');
+        expect(resultUi.reasonCodes).toContain(CLASSIFICATION_REASON_CODES.EXTERNAL_SCRAPED_UI);
+      });
+
+      it('should correctly classify genuine writing examples (IDs 8, 38, 43, 97, 159, 160)', function () {
+        // ID 8
+        const id8 = classifyContent(
+          'so we will write tests for every feature or for whatever feature we want to write and then when we make some changes next time, we can just run that and it will tell if any previous feature is broken or not, and what is its relation with mock and all that'
+        );
+        expect(id8.tier).toBe('tier_b');
+        expect(id8.contentType).toBe('prose');
+        expect(id8.styleSignal).toBe('strong');
+
+        // ID 38
+        const id38 = classifyContent(
+          'I am confused what do I use now, do I download a model and train it on my system or do I use the cloud GPU'
+        );
+        expect(id38.tier).toBe('tier_b');
+        expect(id38.contentType).toBe('prose');
+        expect(id38.styleSignal).toBe('strong');
+
+        // ID 43
+        const id43 = classifyContent(
+          'see we are just building the first version so it\'s fine if not every laptop can run it'
+        );
+        expect(id43.tier).toBe('tier_a');
+        expect(id43.contentType).toBe('prose');
+        expect(id43.styleSignal).toBe('strong');
+
+        // ID 97
+        const id97 = classifyContent(
+          'So I started by learning HTML, CSS and JavaScript and my plan was to learn web development and for that I also learned React, typescript, tailwind and next js, and then did some small project then after that I built match point, but now what I am thinking is everyone can build this with AI'
+        );
+        expect(id97.tier).toBe('tier_a');
+        expect(id97.contentType).toBe('prose');
+        expect(id97.styleSignal).toBe('strong');
+
+        // ID 159
+        const id159 = classifyContent(
+          'I like programming because I wanted to build cool things which come to my mind and along the way solve problems and build software which many people can use and find helpful in their daily lives'
+        );
+        expect(id159.tier).toBe('tier_a');
+        expect(id159.contentType).toBe('prose');
+        expect(id159.styleSignal).toBe('strong');
+
+        // ID 160
+        const id160 = classifyContent(
+          'One thing that really frustrates me is the fact that now anyone with no coding or programming skill can build a software and make money from it, because it kind of makes me feel that my skills are becoming less valuable'
+        );
+        expect(id160.tier).toBe('tier_a');
+        expect(id160.contentType).toBe('prose');
+        expect(id160.styleSignal).toBe('strong');
+      });
     });
   });
 });
